@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "warderbox"
+version = "0.3.5"
+description = "AI agent safety platform: pre-execution cost estimation, execution timeout, idempotency guard, output validation, fallback routing, quotas, smart model routing, cost anomaly detection, rollback, budget control, circuit breakers, tracing, compliance, and chaos testing."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+authors = [
+    { name = "Ali Çelik", email = "alicelik1980@gmail.com" },
+]
+keywords = [
+    "ai", "agent", "safety", "guardrails", "rollback", "testing",
+    "cost-control", "rate-limiting", "multi-agent", "observability",
+    "circuit-breaker", "tracing", "chaos-engineering", "compliance",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+langchain = ["langchain-core>=0.1"]
+crewai = ["crewai>=0.1"]
+autogen = ["pyautogen>=0.2"]
+anthropic = ["anthropic>=0.18"]
+yaml = ["pyyaml>=6.0"]
+all = [
+    "openai>=1.0",
+    "langchain-core>=0.1",
+    "crewai>=0.1",
+    "pyautogen>=0.2",
+    "anthropic>=0.18",
+    "pyyaml>=6.0",
+]
+dev = ["pytest>=7.0", "ruff>=0.1"]
+
+[project.scripts]
+warderbox = "warderbox.cli:main"
+
+[project.urls]
+Homepage = "https://alicelik-games.github.io/warderbox/"
+Documentation = "https://github.com/alicelik-games/warderbox#readme"
+Issues = "https://github.com/alicelik-games/warderbox/issues"
+Changelog = "https://github.com/alicelik-games/warderbox/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/warderbox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

@@ -1,0 +1,54 @@
+{
+  "budget": 25.00,
+  "mode": "production",
+  "db_path": "audit.db",
+  "global_rpm": 120,
+  "global_rph": 3000,
+  "tool_limits": {
+    "send_email": {"rpm": 10, "rph": 100},
+    "run_sql": {"rpm": 30, "rph": 500},
+    "delete_file": {"rpm": 5, "rph": 20}
+  },
+  "rules": [
+    {
+      "name": "no_destructive_sql_prod",
+      "match": {"args_regex": "DROP\\s+TABLE|DROP\\s+DATABASE|TRUNCATE"},
+      "risk": "critical",
+      "reason": "Destructive SQL operations are forbidden"
+    },
+    {
+      "name": "no_production_access",
+      "match": {"args_regex": "prod-db|production\\."},
+      "risk": "critical",
+      "reason": "Direct production database access is blocked"
+    },
+    {
+      "name": "no_secret_access",
+      "match": {"args_contain": "secret"},
+      "risk": "critical",
+      "reason": "Secret/credential access requires manual approval"
+    },
+    {
+      "name": "limit_bulk_deletes",
+      "match": {"tool": "delete_file", "args_contain": "/data/"},
+      "risk": "high",
+      "reason": "Data directory deletions require approval"
+    },
+    {
+      "name": "external_api_warning",
+      "match": {"args_regex": "https?://(?!localhost|127\\.0\\.0\\.1)"},
+      "risk": "medium",
+      "reason": "External API call detected"
+    }
+  ],
+  "webhooks": [
+    {
+      "url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+      "events": ["action_blocked", "budget_exceeded", "budget_warning"]
+    }
+  ],
+  "idempotency": {
+    "enabled": true,
+    "ttl": 3600
+  }
+}

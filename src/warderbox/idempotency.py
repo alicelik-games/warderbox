@@ -1,0 +1,245 @@
+"""Idempotency guard for agent tool calls.
+
+Prevents duplicate execution of the same logical operation,
+so retries of send_email or payment calls don't double-fire.
+
+Supports pluggable backends: in-memory (default) or any external
+store (Redis, database) via the IdempotencyBackend protocol.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class DedupeResult(Enum):
+    ALLOWED = "allowed"
+    DUPLICATE = "duplicate"
+
+
+@dataclass
+class IdempotencyRecord:
+    """A record of a previously executed action."""
+
+    key: str
+    tool_name: str
+    args_hash: str
+    result: Any = None
+    timestamp: float = field(default_factory=time.time)
+    ttl: float = 3600.0
+
+
+class IdempotencyBackend(ABC):
+    """Abstract backend for idempotency record storage."""
+
+    @abstractmethod
+    def get(self, key: str) -> IdempotencyRecord | None: ...
+
+    @abstractmethod
+    def set(self, key: str, record: IdempotencyRecord) -> None: ...
+
+    @abstractmethod
+    def delete(self, key: str) -> bool: ...
+
+    @abstractmethod
+    def clear(self, tool_name: str | None = None) -> int: ...
+
+    @abstractmethod
+    def count(self) -> int: ...
+
+
+class MemoryBackend(IdempotencyBackend):
+    """Thread-safe in-memory backend (default)."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, IdempotencyRecord] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> IdempotencyRecord | None:
+        with self._lock:
+            record = self._records.get(key)
+            if record is None:
+                return None
+            if time.time() - record.timestamp > record.ttl:
+                del self._records[key]
+                return None
+            return record
+
+    def set(self, key: str, record: IdempotencyRecord) -> None:
+        with self._lock:
+            self._records[key] = record
+
+    def delete(self, key: str) -> bool:
+        with self._lock:
+            return self._records.pop(key, None) is not None
+
+    def clear(self, tool_name: str | None = None) -> int:
+        with self._lock:
+            if tool_name is None:
+                count = len(self._records)
+                self._records.clear()
+                return count
+            keys = [k for k, v in self._records.items() if v.tool_name == tool_name]
+            for k in keys:
+                del self._records[k]
+            return len(keys)
+
+    def count(self) -> int:
+        with self._lock:
+            now = time.time()
+            expired = [
+                k for k, v in self._records.items()
+                if now - v.timestamp > v.ttl
+            ]
+            for k in expired:
+                del self._records[k]
+            return len(self._records)
+
+
+class IdempotencyGuard:
+    """Detects and blocks duplicate tool calls.
+
+    An idempotency key is computed from the tool name and its arguments,
+    or supplied by the caller for distributed coordination.
+    If the same key appears within the TTL window, the call is blocked
+    and the cached result is returned instead.
+
+    Usage:
+        guard = IdempotencyGuard(default_ttl=3600)
+        guard.add_protected_tool("send_email")
+
+        # Auto-generated key from args:
+        status, cached = guard.check("send_email", {"to": "a@b.com", "body": "hi"})
+
+        # Client-supplied key for distributed dedup:
+        status, cached = guard.check("send_email", {"to": "a@b.com"}, idempotency_key="order-123-email")
+
+        # Pluggable backend:
+        guard = IdempotencyGuard(backend=RedisBackend(redis_client))
+    """
+
+    def __init__(
+        self,
+        default_ttl: float = 3600.0,
+        protected_tools: set[str] | None = None,
+        backend: IdempotencyBackend | None = None,
+    ) -> None:
+        self._default_ttl = default_ttl
+        self._protected_tools: set[str] = protected_tools or set()
+        self._backend = backend or MemoryBackend()
+        self._duplicates_blocked = 0
+        self._lock = threading.Lock()
+
+    @property
+    def backend(self) -> IdempotencyBackend:
+        return self._backend
+
+    def add_protected_tool(self, tool_name: str, ttl: float | None = None) -> None:
+        self._protected_tools.add(tool_name)
+
+    def remove_protected_tool(self, tool_name: str) -> None:
+        self._protected_tools.discard(tool_name)
+
+    def is_protected(self, tool_name: str) -> bool:
+        return tool_name in self._protected_tools
+
+    @staticmethod
+    def _hash_args(args: dict) -> str:
+        serialized = json.dumps(args, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _make_key(tool_name: str, args_hash: str) -> str:
+        return f"{tool_name}:{args_hash}"
+
+    def check(
+        self,
+        tool_name: str,
+        args: dict,
+        idempotency_key: str | None = None,
+    ) -> tuple[DedupeResult, Any | None]:
+        """Check if this call is a duplicate.
+
+        Returns (ALLOWED, None) for new calls, or
+        (DUPLICATE, cached_result) for repeated ones.
+
+        If idempotency_key is provided, it is used directly instead of
+        hashing the args. This enables distributed deduplication where
+        multiple processes share the same backend.
+        """
+        if tool_name not in self._protected_tools:
+            return DedupeResult.ALLOWED, None
+
+        if idempotency_key is not None:
+            key = f"{tool_name}:{idempotency_key}"
+        else:
+            args_hash = self._hash_args(args)
+            key = self._make_key(tool_name, args_hash)
+
+        record = self._backend.get(key)
+        if record is not None:
+            with self._lock:
+                self._duplicates_blocked += 1
+            return DedupeResult.DUPLICATE, record.result
+        return DedupeResult.ALLOWED, None
+
+    def record(
+        self,
+        tool_name: str,
+        args: dict,
+        result: Any = None,
+        ttl: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> str:
+        """Record a completed execution for deduplication."""
+        if idempotency_key is not None:
+            key = f"{tool_name}:{idempotency_key}"
+            args_hash = idempotency_key
+        else:
+            args_hash = self._hash_args(args)
+            key = self._make_key(tool_name, args_hash)
+
+        entry = IdempotencyRecord(
+            key=key,
+            tool_name=tool_name,
+            args_hash=args_hash,
+            result=result,
+            ttl=ttl or self._default_ttl,
+        )
+        self._backend.set(key, entry)
+        return key
+
+    def invalidate(
+        self,
+        tool_name: str,
+        args: dict,
+        idempotency_key: str | None = None,
+    ) -> bool:
+        """Remove a specific idempotency record (allow re-execution)."""
+        if idempotency_key is not None:
+            key = f"{tool_name}:{idempotency_key}"
+        else:
+            args_hash = self._hash_args(args)
+            key = self._make_key(tool_name, args_hash)
+        return self._backend.delete(key)
+
+    def clear(self, tool_name: str | None = None) -> int:
+        """Clear all records, or only for a specific tool."""
+        return self._backend.clear(tool_name)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "protected_tools": sorted(self._protected_tools),
+                "active_records": self._backend.count(),
+                "duplicates_blocked": self._duplicates_blocked,
+                "default_ttl": self._default_ttl,
+                "backend": type(self._backend).__name__,
+            }
