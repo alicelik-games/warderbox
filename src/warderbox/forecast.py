@@ -116,12 +116,16 @@ class CostForecaster:
         # an absurd burn rate (dividing cost by a microsecond window).
         window = max(observed, self._min_window_seconds)
 
-        total_cost_in_window = sum(costs)
+        # Use the budget's running total (already rounded) rather than
+        # re-summing the per-action costs: this keeps the figures consistent
+        # with reported spend and stable across Python versions (3.12+ changed
+        # float sum() to compensated summation, which shifted the last digit).
+        total_cost_in_window = total_spent
         burn_per_sec = total_cost_in_window / window if window > 0 else 0.0
         burn_per_min = burn_per_sec * 60
         burn_per_hour = burn_per_sec * 3600
 
-        avg_cost = total_cost_in_window / len(costs) if costs else 0.0
+        avg_cost = round(total_spent / len(costs), 10) if costs else 0.0
 
         exhaustion = None
         actions_remaining = None
