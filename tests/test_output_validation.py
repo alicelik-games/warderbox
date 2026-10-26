@@ -1,7 +1,9 @@
 """Tests for output validation."""
 
 from warderbox.output_validation import (
-    OutputValidator, OutputRule, OutputAction,
+    OutputAction,
+    OutputRule,
+    OutputValidator,
 )
 
 

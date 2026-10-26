@@ -1,7 +1,6 @@
 """Tests for pre-execution cost & duration estimation."""
 
-import time
-from warderbox import WarderBox, CostEstimator, Estimate
+from warderbox import CostEstimator, WarderBox
 
 
 class TestCostEstimator:

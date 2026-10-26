@@ -71,13 +71,21 @@ def load_policy(path: str | Path) -> WarderBox:
     else:
         raise ValueError(f"Unsupported policy file format: {suffix} (use .yaml, .yml, or .json)")
 
+    if not isinstance(config, dict):
+        raise ValueError(f"Policy file must contain a mapping, got {type(config).__name__}")
+
+    issues = _validate_config(config)
+    if issues:
+        raise ValueError(
+            "Invalid policy file:\n  - " + "\n  - ".join(issues)
+        )
+
     return WarderBox.from_config(config)
 
 
 def validate_policy(path: str | Path) -> list[str]:
     """Validate a policy file and return a list of warnings/errors."""
     path = Path(path)
-    issues: list[str] = []
 
     if not path.exists():
         return [f"File not found: {path}"]
@@ -96,7 +104,16 @@ def validate_policy(path: str | Path) -> list[str]:
     if not isinstance(config, dict):
         return ["Policy must be a dict/mapping"]
 
-    if "budget" in config and not isinstance(config["budget"], (int, float)):
+    return _validate_config(config)
+
+
+def _validate_config(config: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+
+    if "budget" in config and (
+        isinstance(config["budget"], bool)
+        or not isinstance(config["budget"], (int, float))
+    ):
         issues.append(f"budget should be a number, got {type(config['budget']).__name__}")
 
     if "mode" in config and config["mode"] not in ("production", "test"):
@@ -117,7 +134,10 @@ def validate_policy(path: str | Path) -> list[str]:
         if "url" not in wh:
             issues.append("webhook entry missing 'url'")
 
-    if "global_rpm" in config and not isinstance(config["global_rpm"], int):
+    if "global_rpm" in config and (
+        isinstance(config["global_rpm"], bool)
+        or not isinstance(config["global_rpm"], int)
+    ):
         issues.append("global_rpm should be an integer")
 
     if "global_rph" in config and not isinstance(config["global_rph"], int):

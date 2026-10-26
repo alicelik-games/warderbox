@@ -15,10 +15,25 @@ Usage:
 
 from __future__ import annotations
 
+import html
 import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
+
+from warderbox.logger import _SCHEMA
+
+
+def _to_epoch(value: object) -> float | None:
+    """Accept epoch numbers or ISO-8601 strings, return epoch seconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -53,17 +68,17 @@ class AuditReport:
     @property
     def summary(self) -> str:
         lines = [
-            f"=== WarderBox Audit Report ===",
+            "=== WarderBox Audit Report ===",
             f"Generated: {self.generated_at}",
             f"Period: {self.period_start or 'all'} — {self.period_end or 'now'}",
-            f"",
+            "",
             f"Total actions:    {self.total_actions}",
             f"Successful:       {self.successful_actions}",
             f"Blocked:          {self.blocked_actions} ({self.block_rate:.1%})",
             f"Errors:           {self.error_actions} ({self.error_rate:.1%})",
             f"Total cost:       ${self.total_cost:.2f}",
-            f"",
-            f"Risk breakdown:",
+            "",
+            "Risk breakdown:",
         ]
         for risk, count in sorted(self.risk_breakdown.items()):
             lines.append(f"  {risk}: {count}")
@@ -116,6 +131,14 @@ class ComplianceReporter:
     ) -> AuditReport:
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
+        conn.executescript(_SCHEMA)  # tolerate a fresh/empty database
+        # Older audit DBs predate the fallback_tool column.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(actions)")}
+        if "fallback_tool" not in columns:
+            conn.execute("ALTER TABLE actions ADD COLUMN fallback_tool TEXT")
+        if "reversible" not in columns:
+            conn.execute("ALTER TABLE actions ADD COLUMN reversible INTEGER")
+        conn.commit()
         try:
             return self._build_report(conn, start, end)
         finally:
@@ -129,12 +152,14 @@ class ComplianceReporter:
     ) -> AuditReport:
         where_parts = []
         params: list = []
-        if start:
+        start_epoch = _to_epoch(start)
+        end_epoch = _to_epoch(end)
+        if start_epoch is not None:
             where_parts.append("timestamp >= ?")
-            params.append(start)
-        if end:
+            params.append(start_epoch)
+        if end_epoch is not None:
             where_parts.append("timestamp <= ?")
-            params.append(end)
+            params.append(end_epoch)
 
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
@@ -168,8 +193,9 @@ class ComplianceReporter:
             report.risk_breakdown[r["risk"] or "UNKNOWN"] = r["cnt"]
 
         for r in conn.execute(
-            f"SELECT tool_name, COUNT(*) as cnt FROM actions {where} "
-            f"GROUP BY tool_name ORDER BY cnt DESC",
+            f"SELECT COALESCE(fallback_tool, tool_name) as tool_name, "
+            f"COUNT(*) as cnt FROM actions {where} "
+            f"GROUP BY COALESCE(fallback_tool, tool_name) ORDER BY cnt DESC",
             params,
         ):
             report.tool_usage[r["tool_name"]] = r["cnt"]
@@ -183,8 +209,9 @@ class ComplianceReporter:
             report.blocked_reasons[r["block_reason"] or "Unknown"] = r["cnt"]
 
         for r in conn.execute(
-            f"SELECT tool_name, SUM(cost) as total_cost, COUNT(*) as calls "
-            f"FROM actions {where} GROUP BY tool_name "
+            f"SELECT COALESCE(fallback_tool, tool_name) as tool_name, "
+            f"SUM(cost) as total_cost, COUNT(*) as calls "
+            f"FROM actions {where} GROUP BY COALESCE(fallback_tool, tool_name) "
             f"ORDER BY total_cost DESC LIMIT 10",
             params,
         ):
@@ -195,7 +222,8 @@ class ComplianceReporter:
             })
 
         for r in conn.execute(
-            f"SELECT substr(timestamp, 12, 2) as hour, COUNT(*) as cnt "
+            f"SELECT strftime('%H', datetime(timestamp, 'unixepoch', 'localtime')) as hour, "
+            f"COUNT(*) as cnt "
             f"FROM actions {where} GROUP BY hour ORDER BY hour",
             params,
         ):
@@ -220,7 +248,10 @@ class ComplianceReporter:
                 f"tools may be misconfigured or unavailable"
             )
 
-        critical = report.risk_breakdown.get("CRITICAL", 0)
+        critical = sum(
+            c for k, c in report.risk_breakdown.items()
+            if str(k).upper() == "CRITICAL"
+        )
         if critical > 0:
             anomalies.append(
                 f"{critical} CRITICAL-risk actions attempted"
@@ -242,20 +273,23 @@ class ComplianceReporter:
         report = self.generate_report(**kwargs)
         d = report.to_dict()
 
+        def esc(value: object) -> str:
+            return html.escape(str(value))
+
         risk_rows = "".join(
-            f"<tr><td>{k}</td><td>{v}</td></tr>"
+            f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>"
             for k, v in d["risk_breakdown"].items()
         )
         tool_rows = "".join(
-            f"<tr><td>{k}</td><td>{v}</td></tr>"
+            f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>"
             for k, v in list(d["tool_usage"].items())[:10]
         )
         blocked_rows = "".join(
-            f"<tr><td>{k}</td><td>{v}</td></tr>"
+            f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>"
             for k, v in d["blocked_reasons"].items()
         )
         anomaly_items = "".join(
-            f"<li>{a}</li>" for a in d["anomalies"]
+            f"<li>{esc(a)}</li>" for a in d["anomalies"]
         )
 
         return f"""<!DOCTYPE html>
@@ -280,8 +314,8 @@ th {{ color: #8b949e; }}
 </head>
 <body>
 <h1>WarderBox Audit Report</h1>
-<p>Generated: {d['generated_at']}<br>
-Period: {d['period_start'] or 'all'} &mdash; {d['period_end'] or 'now'}</p>
+<p>Generated: {esc(d['generated_at'])}<br>
+Period: {esc(d['period_start'] or 'all')} &mdash; {esc(d['period_end'] or 'now')}</p>
 
 <div class="cards">
   <div class="card"><div class="value">{d['total_actions']}</div><div class="label">Total Actions</div></div>

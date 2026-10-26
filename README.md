@@ -36,12 +36,12 @@ WarderBox intercepts every tool call your AI agent makes and provides rollback, 
 | Sensitive data in logs | Automatic PII/secret masking |
 | Need audit trail | SQLite logging + Prometheus + compliance reports |
 | Test agent resilience | Chaos engineering with fault injection |
-| Track every action | OpenTelemetry-compatible distributed tracing |
+| Track every action | OpenTelemetry-style distributed tracing |
 | Evaluate agent quality | Safety/performance scoring (A-F grades) |
 | LLM costs too high | Smart Model Routing picks cheapest capable model |
 | Spending spikes unnoticed | Cost Anomaly Detection with z-score alerts |
-| No cost visibility | Real-time FinOps Dashboard with 4 tabs |
-| Tool call hangs forever | Execution Timeout kills it after deadline |
+| No cost visibility | Real-time FinOps Dashboard with 5 tabs |
+| Tool call hangs forever | Execution Timeout stops waiting after the deadline |
 | Agent retries double-fires | Idempotency Guard blocks duplicate calls |
 | Tool leaks sensitive data | Output Validation redacts/blocks bad outputs |
 | Circuit-broken tool blocks agent | Fallback Routing auto-switches to alternative |
@@ -204,13 +204,18 @@ approver.approve(request_id, approver="admin@company.com")
 Fine-grained tool access control per agent:
 
 ```python
-from warderbox import CapabilityManager
+from warderbox import WarderBox, CapabilityManager
 
-caps = CapabilityManager()
+caps = CapabilityManager()  # fail-closed by default: unknown agents are denied
 caps.grant("researcher", allow=["search", "read_file"])
 caps.grant("intern_bot", deny=["delete_record", "send_email"])
 caps.add_constraint("coder", "run_sql", args_deny=["DROP", "TRUNCATE"])
+
+# The shield must know which agent it represents so capabilities apply.
+shield = WarderBox(budget=5.00, agent_name="researcher")
 shield.set_capabilities(caps)
+# (AgentPool.register sets agent_name automatically for each agent.)
+# For a permissive setup, use CapabilityManager(fail_closed=False).
 ```
 
 ### Compliance & Audit Reports
@@ -229,7 +234,7 @@ html = reporter.to_html()      # Full HTML report
 
 ### Distributed Tracing
 
-OpenTelemetry-compatible span system:
+OpenTelemetry-style span system (JSON export; not OTLP wire format):
 
 ```python
 from warderbox import Tracer
@@ -285,7 +290,7 @@ print(pool_scorer.summary())   # Ranked leaderboard
 warderbox --db audit.db dashboard --port 8080
 ```
 
-Real-time web UI with 4 tabs: Overview, FinOps, Routing, and Alerts.
+Real-time web UI with 5 tabs: Overview, FinOps, Estimation, Routing, and Alerts.
 
 ### Smart Model Routing (FinOps)
 
@@ -299,7 +304,7 @@ router.add_model("opus", cost_per_1k=0.015, max_complexity=1.0)
 
 decision = router.route("Summarize this text")
 print(decision.model)           # "haiku" (cheapest capable)
-print(decision.estimated_cost)  # $0.00025/1k tokens
+print(decision.estimated_cost_per_1k)  # $0.00025/1k tokens
 
 stats = router.stats()
 print(stats.savings_percent)    # 60-90% cost savings
@@ -390,7 +395,7 @@ shield.set_timeout(TimeoutExecutor(TimeoutPolicy(
 
 @shield.tool(cost=0.05)
 def slow_api(query: str) -> str:
-    return external_api.call(query)  # killed if >60s
+    return external_api.call(query)  # times out after 60s
 ```
 
 ### Idempotency Guard
@@ -510,7 +515,7 @@ warderbox dashboard --port 8080    # Start web dashboard
 |-------|----------|----------|
 | LOW | Execute normally | SELECT queries, file reads |
 | MEDIUM | Execute with logging | Outbound messages, moderate operations |
-| HIGH | Ask user for approval | Bulk operations (>100 items) |
+| HIGH | Ask for approval *(when an ApprovalManager or on_block callback is configured)* | Bulk operations (>100 items) |
 | CRITICAL | Auto-block | DROP TABLE, TRUNCATE, DELETE FROM |
 
 ## Architecture
@@ -542,7 +547,7 @@ Agent -> WarderBox -> Tool
 
 ## Stats
 
-- **42 Python modules**, 390 tests
+- **42 Python modules**, 493 tests
 - **Zero mandatory dependencies**
 - **5 framework integrations**
 - Works with Python 3.11+

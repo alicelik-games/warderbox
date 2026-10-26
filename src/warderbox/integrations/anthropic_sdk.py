@@ -23,7 +23,8 @@ Usage:
 from __future__ import annotations
 
 import json
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from warderbox.action import Action, ActionResult
 from warderbox.shield import WarderBox
@@ -72,11 +73,16 @@ class AnthropicShieldMiddleware:
 
         cost = self._cost_map.get(tool_name, 0.0)
 
-        action = Action(
-            tool_name=tool_name,
-            args=tool_input,
-            cost=cost,
-        )
+        # Preserve Claude's tool_use id so the returned tool_result can be
+        # matched back to the originating tool_use block.
+        action_kwargs: dict[str, Any] = {
+            "tool_name": tool_name,
+            "args": tool_input,
+            "cost": cost,
+        }
+        if tool_id:
+            action_kwargs["id"] = tool_id
+        action = Action(**action_kwargs)
 
         executor = self._executors.get(tool_name)
         if executor is None:

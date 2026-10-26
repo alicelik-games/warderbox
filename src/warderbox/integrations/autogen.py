@@ -29,9 +29,10 @@ Usage:
 from __future__ import annotations
 
 import functools
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-from warderbox.action import Action, ActionResult
+from warderbox.action import Action
 from warderbox.shield import WarderBox
 
 

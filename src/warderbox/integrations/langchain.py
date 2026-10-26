@@ -23,10 +23,19 @@ Usage:
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import inspect
+from collections.abc import Callable
+from typing import Any
 
-from warderbox.action import Action, ActionResult
-from warderbox.shield import WarderBox
+from warderbox.action import Action
+from warderbox.shield import WarderBox, _canonicalize_args
+
+
+def _signature(func: Callable) -> inspect.Signature | None:
+    try:
+        return inspect.signature(func)
+    except (ValueError, TypeError):
+        return None
 
 
 class ShieldedTool:
@@ -62,23 +71,32 @@ class ShieldedTool:
             }
 
     def run(self, tool_input: str | dict, **kwargs: Any) -> str:
-        """LangChain calls this method."""
-        if isinstance(tool_input, str):
-            args = {"input": tool_input}
-        else:
-            args = tool_input
+        """LangChain calls this method.
 
-        action = Action(tool_name=self.name, args=args, cost=self.cost)
-        result = self.shield._execute(action, self._call, (), args, self.cost, None)
+        A string input is passed positionally (so a tool declared as
+        ``def run_sql(sql): ...`` works); a dict input is bound by name.
+        """
+        if isinstance(tool_input, dict):
+            call_args: tuple = ()
+            call_kwargs: dict = dict(tool_input)
+        else:
+            call_args = (tool_input,)
+            call_kwargs = {}
+
+        action = Action(
+            tool_name=self.name,
+            args=_canonicalize_args(_signature(self.func), call_args, call_kwargs),
+            cost=self.cost,
+        )
+        result = self.shield._execute(
+            action, self.func, call_args, call_kwargs, self.cost, None
+        )
 
         if result.blocked:
             return f"[BLOCKED] {result.block_reason}"
         if result.error:
             return f"[ERROR] {result.error}"
         return str(result.output)
-
-    def _call(self, **kwargs: Any) -> Any:
-        return self.func(**kwargs)
 
     # LangChain compatibility
     _run = run

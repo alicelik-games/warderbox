@@ -87,5 +87,7 @@ def parse_config(config: dict[str, Any]) -> dict[str, Any]:
         "auto_snapshot": config.get("auto_snapshot", True),
         "max_snapshots": config.get("max_snapshots", 1000),
         "extra_rules": rules_from_config(config.get("rules", [])),
-        "db_path": config.get("db_path", "warderbox.db"),
+        # No implicit DB: only persist when the config explicitly asks for it,
+        # so loading a policy never writes a file into the current directory.
+        "db_path": config.get("db_path"),
     }

@@ -138,7 +138,7 @@ class AgentScorer:
             return 100.0
 
         critical_attempts = sum(
-            1 for h in history if h["risk"] == "CRITICAL"
+            1 for h in history if str(h["risk"]).upper() == "CRITICAL"
         )
 
         score = 100.0
@@ -191,7 +191,7 @@ class AgentScorer:
 
         risk_weights = {"LOW": 0, "MEDIUM": 1, "HIGH": 3, "CRITICAL": 10}
         total_risk_points = sum(
-            risk_weights.get(h["risk"], 0) for h in history
+            risk_weights.get(str(h["risk"]).upper(), 0) for h in history
         )
 
         avg_risk = total_risk_points / len(history)

@@ -9,16 +9,15 @@ import time
 sys.path.insert(0, "src")
 
 from warderbox import (
-    WarderBox,
     AgentScorer,
     ChaosEngine,
     CostForecaster,
     FaultType,
     PoolScorer,
     Tracer,
+    WarderBox,
 )
 from warderbox.multiagent import AgentPool
-
 
 # -- Distributed Tracing --
 

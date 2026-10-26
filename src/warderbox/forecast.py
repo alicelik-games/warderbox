@@ -11,7 +11,6 @@ Usage:
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -34,7 +33,7 @@ class CostForecast:
     @property
     def summary(self) -> str:
         lines = [
-            f"=== Cost Forecast ===",
+            "=== Cost Forecast ===",
             f"Spent: ${self.total_spent:.2f}",
         ]
         if self.budget is not None:
@@ -78,8 +77,9 @@ class CostForecast:
 class CostForecaster:
     """Analyzes spending patterns and predicts budget exhaustion."""
 
-    def __init__(self, shield) -> None:
+    def __init__(self, shield, min_window_seconds: float = 60.0) -> None:
         self._shield = shield
+        self._min_window_seconds = min_window_seconds
 
     def forecast(self) -> CostForecast:
         history = self._shield.history()
@@ -111,7 +111,10 @@ class CostForecaster:
 
         first_time = self._parse_ts(first_ts)
         last_time = self._parse_ts(last_ts)
-        window = (last_time - first_time).total_seconds() if first_time != last_time else 1.0
+        observed = (last_time - first_time).total_seconds()
+        # Floor the observation window so a burst of fast calls doesn't produce
+        # an absurd burn rate (dividing cost by a microsecond window).
+        window = max(observed, self._min_window_seconds)
 
         total_cost_in_window = sum(costs)
         burn_per_sec = total_cost_in_window / window if window > 0 else 0.0
@@ -131,7 +134,8 @@ class CostForecaster:
 
         cost_by_tool: dict[str, float] = {}
         for h in history:
-            tool = h["tool"]
+            # Attribute a fallback call to the tool that actually ran.
+            tool = h.get("fallback") or h["tool"]
             cost_by_tool[tool] = cost_by_tool.get(tool, 0.0) + (h["cost"] or 0.0)
 
         trend = self._detect_trend(history)
@@ -167,7 +171,12 @@ class CostForecaster:
         return "stable"
 
     @staticmethod
-    def _parse_ts(ts: str) -> datetime:
+    def _parse_ts(ts: str | float) -> datetime:
+        if isinstance(ts, (int, float)):
+            try:
+                return datetime.fromtimestamp(ts)
+            except (ValueError, OSError, OverflowError):
+                return datetime.now()
         try:
             return datetime.fromisoformat(ts)
         except (ValueError, TypeError):

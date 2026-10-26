@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 
 @dataclass
@@ -68,7 +68,7 @@ def execute_with_retry(
             return result, errors
         except Exception as e:
             errors.append(e)
-            if not policy.should_retry(e, attempt + 1):
+            if not policy.should_retry(e, attempt):
                 raise
             delay = policy.delay_for(attempt)
             time.sleep(delay)

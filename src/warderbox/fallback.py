@@ -8,8 +8,8 @@ instead of blocking the agent entirely.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 
 @dataclass

@@ -18,11 +18,12 @@ Usage:
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
 
 
 class AnomalyType(Enum):
@@ -88,14 +89,16 @@ class AnomalyDetector:
         self._on_alert = on_alert
 
         self._records: deque[CostRecord] = deque(maxlen=window_size * 2)
-        self._alerts: list[AnomalyAlert] = []
+        self._alerts: deque[AnomalyAlert] = deque(maxlen=1000)
         self._tool_costs: dict[str, list[float]] = {}
         self._recent_tools: deque[str] = deque(maxlen=loop_threshold * 2)
         self._baseline_burn_rate: float | None = None
+        self._lock = threading.RLock()
 
     @property
     def alerts(self) -> list[AnomalyAlert]:
-        return list(self._alerts)
+        with self._lock:
+            return list(self._alerts)
 
     def set_callback(self, fn: Callable[[AnomalyAlert], None]) -> None:
         self._on_alert = fn
@@ -104,6 +107,7 @@ class AnomalyDetector:
         self._baseline_burn_rate = rate_per_minute
 
     def record(self, tool_name: str, cost: float, timestamp: float | None = None) -> list[AnomalyAlert]:
+      with self._lock:
         ts = timestamp or time.time()
         rec = CostRecord(tool_name=tool_name, cost=cost, timestamp=ts)
         self._records.append(rec)
@@ -111,6 +115,8 @@ class AnomalyDetector:
         if tool_name not in self._tool_costs:
             self._tool_costs[tool_name] = []
         self._tool_costs[tool_name].append(cost)
+        if len(self._tool_costs[tool_name]) > self._window_size * 2:
+            self._tool_costs[tool_name] = self._tool_costs[tool_name][-self._window_size:]
 
         self._recent_tools.append(tool_name)
 
@@ -139,11 +145,15 @@ class AnomalyDetector:
         for a in new_alerts:
             self._alerts.append(a)
             if self._on_alert:
-                self._on_alert(a)
+                try:
+                    self._on_alert(a)
+                except Exception:
+                    pass  # a faulty alert callback must not break detection
 
         return new_alerts
 
     def check(self) -> list[AnomalyAlert]:
+      with self._lock:
         if not self._records:
             return []
         last = self._records[-1]
@@ -160,6 +170,7 @@ class AnomalyDetector:
         return alerts
 
     def stats(self) -> dict:
+      with self._lock:
         costs = [r.cost for r in self._records]
         return {
             "total_records": len(self._records),

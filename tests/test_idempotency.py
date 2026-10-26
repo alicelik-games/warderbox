@@ -1,9 +1,13 @@
 """Tests for idempotency guard."""
 
 import time
+
 from warderbox.idempotency import (
-    IdempotencyGuard, DedupeResult,
-    IdempotencyBackend, MemoryBackend, IdempotencyRecord,
+    DedupeResult,
+    IdempotencyBackend,
+    IdempotencyGuard,
+    IdempotencyRecord,
+    MemoryBackend,
 )
 
 

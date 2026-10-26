@@ -7,8 +7,9 @@ block the agent forever or burn budget silently.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 
 class TimeoutError(Exception):

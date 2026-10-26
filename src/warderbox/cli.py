@@ -32,7 +32,10 @@ def cmd_logs(args: argparse.Namespace) -> None:
         status = "BLOCKED" if row["blocked"] else "OK"
         risk = row.get("risk", "?")
         cost = row.get("cost", 0)
-        print(f"[{status}] {row['tool_name']} | risk={risk} cost=${cost:.2f} | {row['args'][:80]}")
+        tool = row["tool_name"]
+        if row.get("fallback_tool"):
+            tool = f"{tool} -> {row['fallback_tool']}"
+        print(f"[{status}] {tool} | risk={risk} cost=${cost:.2f} | {row['args'][:80]}")
         if row.get("block_reason"):
             print(f"         reason: {row['block_reason']}")
         if row.get("error"):
@@ -59,16 +62,13 @@ def cmd_validate(args: argparse.Namespace) -> None:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
+    from warderbox import WarderBox
     from warderbox.dashboard import start_dashboard
-    from warderbox.policy import load_policy
 
-    if args.db == "warderbox.db":
-        from warderbox import WarderBox
-        shield = WarderBox(db_path=args.db)
-    else:
-        shield = WarderBox(db_path=args.db)
+    shield = WarderBox(db_path=args.db)
+    loaded = shield.load_history_from_db()
 
-    print(f"WarderBox Dashboard: http://127.0.0.1:{args.port}")
+    print(f"WarderBox Dashboard: http://127.0.0.1:{args.port} ({loaded} actions from {args.db})")
     start_dashboard(shield, port=args.port, background=False)
 
 

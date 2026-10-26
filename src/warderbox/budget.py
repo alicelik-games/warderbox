@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 
@@ -42,14 +43,20 @@ class BudgetTracker:
     workers cannot overshoot the budget.
     """
 
-    def __init__(self, budget: float | None = None, warn_at: float = 0.8) -> None:
+    def __init__(
+        self, budget: float | None = None, warn_at: float = 0.8,
+        max_entries: int = 100_000,
+    ) -> None:
         self._budget = budget
         self._warn_at = warn_at
-        self._entries: list[CostEntry] = []
+        # Bounded history of cost entries; `spent` is tracked separately so
+        # trimming old entries never changes the cumulative total.
+        self._entries: deque[CostEntry] = deque(maxlen=max_entries)
         self._reservations: dict[str, Reservation] = {}
         self._lock = threading.Lock()
         self._total_reserved: float = 0.0
         self._reconciliation_drift: float = 0.0
+        self._spent: float = 0.0  # running total, kept O(1)
 
     @property
     def budget(self) -> float | None:
@@ -57,7 +64,9 @@ class BudgetTracker:
 
     @property
     def spent(self) -> float:
-        return sum(e.cost for e in self._entries)
+        # Round to sub-nanocent precision so the O(1) running total does not
+        # accumulate float drift (keeps parity with summing the entries).
+        return round(self._spent, 10)
 
     @property
     def reserved(self) -> float:
@@ -130,6 +139,7 @@ class BudgetTracker:
                 reconciled=actual_cost is not None,
             )
             self._entries.append(entry)
+            self._spent += final_cost
             return entry
 
     def release(self, reservation_id: str) -> bool:
@@ -148,6 +158,7 @@ class BudgetTracker:
                 if entry.action_id == action_id and not entry.reconciled:
                     drift = actual_cost - entry.cost
                     self._reconciliation_drift += drift
+                    self._spent += drift
                     entry.estimated_cost = entry.cost
                     entry.actual_cost = actual_cost
                     entry.cost = actual_cost
@@ -165,7 +176,23 @@ class BudgetTracker:
         )
         with self._lock:
             self._entries.append(entry)
+            self._spent += cost
         return entry
+
+    def reset(self, keep_reservations: bool = True) -> None:
+        """Clear recorded (committed) cost and the running total.
+
+        Active reservations are preserved by default so resetting spend (e.g.
+        when rebuilding history from a log) never invalidates an in-flight
+        reservation that still needs to be committed.
+        """
+        with self._lock:
+            self._entries.clear()
+            self._reconciliation_drift = 0.0
+            self._spent = 0.0
+            if not keep_reservations:
+                self._reservations.clear()
+                self._total_reserved = 0.0
 
     def summary(self) -> dict:
         return {

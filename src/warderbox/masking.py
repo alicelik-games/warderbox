@@ -29,7 +29,7 @@ Usage:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -164,15 +164,46 @@ class DataMasker:
         if isinstance(data, dict):
             masked = {}
             for key, value in data.items():
-                if isinstance(value, str):
-                    masked[key] = self.mask_string(value)
-                elif isinstance(value, (dict, list)):
+                if isinstance(value, (dict, list)):
                     masked[key] = self.mask(value)
+                    continue
+                if isinstance(value, str):
+                    m = self.mask_string(value)
                 else:
-                    masked[key] = value
+                    m = self._mask_scalar(value)
+                # Key-aware fallback: a sensitive key whose value no pattern
+                # matched (e.g. a bare numeric SSN) is redacted wholesale.
+                if (
+                    self._is_sensitive_key(key)
+                    and m == value
+                    and value not in (None, "")
+                ):
+                    m = "[REDACTED]"
+                masked[key] = m
             return masked
 
-        return data
+        return self._mask_scalar(data)
+
+    _SENSITIVE_KEYS = (
+        "ssn", "social_security", "password", "passwd", "secret",
+        "token", "api_key", "apikey", "credit_card", "card_number",
+        "cardnumber", "cvv", "pin",
+    )
+
+    def _is_sensitive_key(self, key) -> bool:
+        if not isinstance(key, str):
+            return False
+        k = key.lower()
+        return any(s in k for s in self._SENSITIVE_KEYS)
+
+    def _mask_scalar(self, value):
+        """Mask numeric PII (e.g. a card number passed as an int) without
+        changing the value when it isn't sensitive."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return value
+        text = str(value)
+        masked = self.mask_string(text)
+        return masked if masked != text else value
 
     def detect(self, text: str) -> list[str]:
         """Detect which patterns match in the given text (without masking)."""

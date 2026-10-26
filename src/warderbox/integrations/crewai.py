@@ -24,10 +24,19 @@ Usage:
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import inspect
+from collections.abc import Callable
+from typing import Any
 
-from warderbox.action import Action, ActionResult
-from warderbox.shield import WarderBox
+from warderbox.action import Action
+from warderbox.shield import WarderBox, _canonicalize_args
+
+
+def _signature(func: Callable) -> inspect.Signature | None:
+    try:
+        return inspect.signature(func)
+    except (ValueError, TypeError):
+        return None
 
 
 class ShieldedCrewTool:
@@ -51,14 +60,15 @@ class ShieldedCrewTool:
         self._cost = cost
 
     def run(self, *args: Any, **kwargs: Any) -> str:
-        """Execute the tool through the shield. Returns string output."""
-        if args and not kwargs:
-            kwargs = {"input": args[0]}
-            args = ()
+        """Execute the tool through the shield. Returns string output.
 
+        Positional args are passed through positionally (so a tool declared
+        as ``def search(query): ...`` works); the action's args dict is
+        canonicalized to the real parameter names for the rule engine.
+        """
         action = Action(
             tool_name=self.name,
-            args=kwargs,
+            args=_canonicalize_args(_signature(self._func), args, kwargs),
             cost=self._cost,
         )
 

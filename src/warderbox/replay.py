@@ -24,11 +24,11 @@ Usage:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
 
-from warderbox.action import Action, ActionResult
+from warderbox.action import Action
 from warderbox.logger import ActionLogger
 
 
@@ -151,12 +151,23 @@ class ActionReplayer:
                 details=f"No executor for '{tool_name}'",
             )
 
+        # Legacy / signature-less captures store positional args as
+        # {"args": [...]}; unpack those positionally instead of as kwargs.
+        if (
+            isinstance(args, dict)
+            and set(args.keys()) == {"args"}
+            and isinstance(args["args"], list)
+        ):
+            call_args, call_kwargs = tuple(args["args"]), {}
+        else:
+            call_args, call_kwargs = (), args
+
         action = Action(tool_name=tool_name, args=args, cost=row.get("cost", 0))
         result = shield._execute(
             action=action,
             func=executor,
-            args=(),
-            kwargs=args,
+            args=call_args,
+            kwargs=call_kwargs,
             cost=row.get("cost", 0),
             risk_override=None,
         )

@@ -10,15 +10,14 @@ import time
 sys.path.insert(0, "src")
 
 from warderbox import (
-    WarderBox,
     ApprovalManager,
     CapabilityManager,
     CircuitBreaker,
     CircuitState,
     ComplianceReporter,
+    WarderBox,
 )
 from warderbox.approval import ApprovalDecision
-
 
 # -- Circuit Breaker --
 
@@ -279,9 +278,15 @@ def test_capabilities_max_cost():
 
 
 def test_capabilities_unknown_agent():
+    # Secure default: an agent with no granted capabilities is denied.
     caps = CapabilityManager()
     ok, _ = caps.check("unknown_agent", "any_tool")
-    assert ok
+    assert not ok
+
+    # Opt-out for permissive setups.
+    permissive = CapabilityManager(fail_closed=False)
+    ok2, _ = permissive.check("unknown_agent", "any_tool")
+    assert ok2
 
 
 def test_capabilities_revoke():

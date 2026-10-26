@@ -1,9 +1,10 @@
 """Tests for WarderBox core functionality."""
 
 import sys
+
 sys.path.insert(0, "src")
 
-from warderbox import WarderBox, RiskLevel
+from warderbox import WarderBox
 
 
 def make_shield(**kwargs):

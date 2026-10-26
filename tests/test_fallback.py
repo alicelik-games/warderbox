@@ -1,6 +1,6 @@
 """Tests for fallback tool routing."""
 
-from warderbox.fallback import FallbackManager, FallbackRoute
+from warderbox.fallback import FallbackManager
 
 
 def test_register_and_get():

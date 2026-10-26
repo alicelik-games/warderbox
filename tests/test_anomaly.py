@@ -1,8 +1,8 @@
 """Tests for cost anomaly detection."""
 
 import time
-import pytest
-from warderbox.anomaly import AnomalyDetector, AnomalyType, AnomalyAlert
+
+from warderbox.anomaly import AnomalyAlert, AnomalyDetector, AnomalyType
 
 
 def test_no_alerts_on_normal_costs():

@@ -2,6 +2,64 @@
 
 All notable changes to WarderBox are documented here.
 
+## [0.3.6] - 2026-10-24
+
+A large security & correctness hardening release over 0.3.5, consolidating an
+extensive multi-pass review of the execution pipeline. 90+ new regression
+tests (493 total). No signature-level public API breakage; behavior is now
+fail-safe by default (notably capabilities fail closed and `risk=` is a floor).
+
+### Security & correctness
+- **Argument canonicalization** (`shield.py`, `rules.py`): tool arguments are bound to real parameter names via `inspect.signature`, and content rules scan nested structures — destructive-SQL / content rules can no longer be bypassed by positional or nested arguments
+- **Risk override is a floor, not a ceiling** (`shield.py`): a per-tool `risk=` can only *raise* risk; declaring a tool LOW can never suppress a CRITICAL pattern detected in its arguments
+- **Approval enforcement** (`shield.py`): `ApprovalManager` is wired into the sync and async pipelines; denied/timed-out approvals actually block execution
+- **Capability enforcement** (`capabilities.py`, `multiagent.py`): `agent_name` is a first-class argument set by `AgentPool`; `CapabilityManager` defaults to **fail-closed** for unknown agents and is thread-safe
+- **Log masking** (`logger.py`): `DataMasker` redacts tool output, errors and block reasons (not just arguments); sensitive keys (ssn, password, token, card, …) are redacted even when numeric/unformatted
+- **Retry correctness** (`retry.py`, `shield.py`): fixed an off-by-one in retry counting; idempotency-protected tools don't auto-retry
+- **Timeout composition** (`shield.py`): execution timeout applies on every attempt, including with a retry policy
+- **Test mode** (`shield.py`): dry-run consumes no real budget/rate/quota state, but still evaluates every policy (including on the fallback path)
+
+### Atomic idempotency & concurrency
+- **Atomic idempotency** (`idempotency.py`, `shield.py`): `set_if_absent`/`begin`/`complete`/`fail` with an in-flight reservation (Redis uses SET NX) — concurrent calls and caller-level retries cannot double-fire a protected side effect
+- **Atomic rate-limit & quota** (`ratelimit.py`, `quota.py`, `shield.py`): `reserve`/`release` close the concurrent-overrun race; `set_quota` preserves counters across restarts (durable quota backend)
+- **Circuit breaker** (`circuitbreaker.py`): fixed a permanent HALF_OPEN lockout; reentrant lock + callbacks invoked outside the lock
+- **Concurrency-safe history** (`shield.py`): `history()`/`stats()` snapshot under a lock
+- **Thread-safety**: locks on `RateLimiter`, `CircuitBreaker`, `Tracer`, `AnomalyDetector`; bounded history, spans, alerts and budget entries; O(1) budget spend; thread-safe SQLite logger (WAL + lock)
+
+### Async
+- **Shared pipeline** (`shield.py`, `async_shield.py`): sync and async share one guard pipeline; async enforces the full guard set with budget reservation
+- **Non-blocking** (`async_shield.py`): the pipeline runs via `asyncio.to_thread` so a human-approval wait never freezes the event loop; async fallbacks are awaited and bounded by timeout
+- **Cancellation state machine** (`async_shield.py`): a cancelled task keeps its idempotency marker when execution had started (avoids duplicate side effects) and releases it otherwise; preflight is shielded so a mid-preflight cancel never orphans a reservation
+
+### Fallback parity
+- Fallbacks pass the full guard set — capability (on the fallback tool), risk floor, on_block, approval (for whichever tool carries the policy), budget/rate/quota reservation, timeout, output validation, idempotency — and are recorded in the estimator, anomaly detector, tracer, history (`history()["fallback"]`, `fallback_tool` DB column), and snapshot store (rollback/reversibility)
+- **Fallback error hardening**: a raising output validator, fallback-function exception/`BaseException`, or idempotency backend failure no longer leaks budget/rate/quota reservations or leaves an unusable in-flight marker; the call returns a normal error result (or records the interruption before re-raising)
+
+### Audit & interruption
+- **Interrupted calls are audited**: sync `KeyboardInterrupt` and async cancellation/`BaseException` now write an error result to history and close the tracer span before propagating; budget/rate/quota are released
+- **Idempotency backend failures** (`complete`/`fail`) emit an `idempotency_error` event instead of turning a completed call into a caller-visible exception
+
+### Side-channel isolation
+- A faulty/custom **estimator, tracer, audit logger, anomaly detector**, or any **callback** (`on_open`/`on_close`, `on_block`, `on_alert`, approval request) can no longer crash or corrupt the tool call it observes. `on_block` fails closed. Reservations are released on preflight exceptions and sync interruption (`KeyboardInterrupt`)
+
+### Reporting, adapters & tooling
+- **Compliance** (`compliance.py`): epoch-aware date filtering, correct hourly distribution, case-insensitive CRITICAL anomaly detection, schema guard on fresh DBs, HTML escaping
+- **Forecast** (`forecast.py`): epoch timestamps + floored observation window → realistic burn rates
+- **Scoring** (`scoring.py`): risk levels normalized so critical attempts are penalized
+- **CLI/dashboard** (`cli.py`, `shield.py`): `stats` no longer crashes on empty/populated DBs; the CLI dashboard loads history and rebuilds budget from the database (idempotently)
+- **Framework adapters** (`integrations/`): Anthropic tool_result ids match the originating tool_use; LangChain/CrewAI pass string inputs positionally; replay unpacks legacy positional captures
+- **Packaging/CI**: `py.typed`, GitHub Actions matrix (3.11–3.13: ruff + tests + build + demo), `RedisBackend`, `Mode` exported, ruff clean
+
+## [0.3.5] - 2026-10-21
+
+### Changed
+- License moved to PolyForm Noncommercial 1.0.0 (commercial license available); PyPI metadata reads the LICENSE file directly
+
+## [0.3.4] - 2026-10-20
+
+### Changed
+- Packaging and description refinements; license classifier updates
+
 ## [0.3.3] - 2026-10-19
 
 ### Added — Community Feedback + Cost Intelligence

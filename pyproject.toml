@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "warderbox"
-version = "0.3.5"
+version = "0.3.6"
 description = "AI agent safety platform: pre-execution cost estimation, execution timeout, idempotency guard, output validation, fallback routing, quotas, smart model routing, cost anomaly detection, rollback, budget control, circuit breakers, tracing, compliance, and chaos testing."
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -65,3 +65,21 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.ruff.lint]
+# Keep pyflakes/bugbear-class errors; silence opinionated style lints that
+# don't indicate defects for this codebase.
+ignore = [
+    "BLE001",  # blind `except Exception` — intentional in best-effort paths
+    "SIM102",  # nested-if collapse — readability preference
+    "SIM103",  # return-condition-directly — readability preference
+    "DTZ005",  # datetime.now() without tz — local reporting only
+    "DTZ006",  # datetime.fromtimestamp() without tz — local reporting only
+    "S110",    # try-except-pass — intentional in best-effort webhook sends
+    "RUF059",  # unused unpacked variable
+    "PLW1510", # subprocess.run without explicit check (tests assert manually)
+    "TRY004",  # prefer TypeError — ValueError is intentional for policy parsing
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F811", "F841"]  # fixtures / intentional redefinitions in tests

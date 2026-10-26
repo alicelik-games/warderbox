@@ -45,6 +45,9 @@ class ActionResult:
     snapshot_id: str | None = None
     cost: float = 0.0
     reversible: bool | None = None
+    # Set when this result came from a circuit-breaker fallback route. The
+    # primary action remains action.tool_name; this records what actually ran.
+    fallback_tool: str | None = None
 
     @property
     def success(self) -> bool:

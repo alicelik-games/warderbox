@@ -31,7 +31,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from warderbox.logger import ActionLogger
 from warderbox.ratelimit import ToolLimit
 from warderbox.shield import WarderBox
 
@@ -69,7 +68,21 @@ class AgentPool:
             raise ValueError(f"Agent '{name}' is already registered")
 
         if config:
-            shield = WarderBox.from_config(config)
+            # Explicit arguments override values from the config dict, so
+            # pool.register("x", budget=3, config=cfg) is not silently ignored.
+            merged = dict(config)
+            if budget is not None:
+                merged["budget"] = budget
+            if mode is not None:
+                merged["mode"] = mode
+            if db_path is not None:
+                merged["db_path"] = db_path
+            if global_rpm is not None:
+                merged["global_rpm"] = global_rpm
+            if global_rph is not None:
+                merged["global_rph"] = global_rph
+            shield = WarderBox.from_config(merged)
+            shield._agent_name = name
         else:
             shield = WarderBox(
                 budget=budget if budget is not None else self._default_budget,
@@ -78,6 +91,7 @@ class AgentPool:
                 global_rpm=global_rpm,
                 global_rph=global_rph,
                 tool_limits=tool_limits,
+                agent_name=name,
             )
 
         self._agents[name] = shield

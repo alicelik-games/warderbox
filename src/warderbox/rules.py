@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from warderbox.action import Action, RiskLevel
 
@@ -15,7 +15,7 @@ _DESTRUCTIVE_SQL = re.compile(
 )
 _BULK_UPDATE_SQL = re.compile(
     r"\b(UPDATE\s+\w+\s+SET)\b(?!.*\bWHERE\b)",
-    re.IGNORECASE,
+    re.IGNORECASE | re.DOTALL,  # DOTALL so a WHERE on a later line still counts
 )
 
 
@@ -29,18 +29,37 @@ class Rule:
     reason: str
 
 
+def _iter_strings(value: object):
+    """Yield every string anywhere inside a (possibly nested) value."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _iter_strings(v)
+    elif isinstance(value, (list, tuple, set)):
+        for v in value:
+            yield from _iter_strings(v)
+
+
+def _iter_ints(value: object, keys: set[str]):
+    """Yield ints stored under any of *keys*, recursing through containers."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k in keys and isinstance(v, bool) is False and isinstance(v, int):
+                yield v
+            else:
+                yield from _iter_ints(v, keys)
+    elif isinstance(value, (list, tuple, set)):
+        for v in value:
+            yield from _iter_ints(v, keys)
+
+
 def _check_destructive_sql(action: Action) -> bool:
-    for val in action.args.values():
-        if isinstance(val, str) and _DESTRUCTIVE_SQL.search(val):
-            return True
-    return False
+    return any(_DESTRUCTIVE_SQL.search(s) for s in _iter_strings(action.args))
 
 
 def _check_bulk_update_sql(action: Action) -> bool:
-    for val in action.args.values():
-        if isinstance(val, str) and _BULK_UPDATE_SQL.search(val):
-            return True
-    return False
+    return any(_BULK_UPDATE_SQL.search(s) for s in _iter_strings(action.args))
 
 
 def _check_file_delete(action: Action) -> bool:
@@ -52,9 +71,7 @@ def _check_send_message(action: Action) -> bool:
 
 
 def _check_bulk_operation(action: Action) -> bool:
-    count = action.args.get("count", 0)
-    limit = action.args.get("limit", 0)
-    return isinstance(count, int) and count > 100 or isinstance(limit, int) and limit > 100
+    return any(n > 100 for n in _iter_ints(action.args, {"count", "limit"}))
 
 
 DEFAULT_RULES: list[Rule] = [
@@ -85,7 +102,7 @@ DEFAULT_RULES: list[Rule] = [
     Rule(
         name="bulk_operation",
         check=_check_bulk_operation,
-        risk=RiskLevel.MEDIUM,
+        risk=RiskLevel.HIGH,
         reason="Bulk operation (>100 items)",
     ),
 ]

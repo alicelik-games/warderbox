@@ -34,6 +34,7 @@ class IdempotencyRecord:
     result: Any = None
     timestamp: float = field(default_factory=time.time)
     ttl: float = 3600.0
+    in_flight: bool = False
 
 
 class IdempotencyBackend(ABC):
@@ -44,6 +45,19 @@ class IdempotencyBackend(ABC):
 
     @abstractmethod
     def set(self, key: str, record: IdempotencyRecord) -> None: ...
+
+    def set_if_absent(self, key: str, record: IdempotencyRecord) -> bool:
+        """Store the record only if the key is absent; return True if stored.
+
+        Used to reserve an in-flight slot so concurrent or retried calls
+        cannot both execute a protected tool. The default implementation is a
+        non-atomic get-then-set fallback for third-party backends; built-in
+        backends override it with a truly atomic version (lock / Redis SET NX).
+        """
+        if self.get(key) is not None:
+            return False
+        self.set(key, record)
+        return True
 
     @abstractmethod
     def delete(self, key: str) -> bool: ...
@@ -76,6 +90,14 @@ class MemoryBackend(IdempotencyBackend):
         with self._lock:
             self._records[key] = record
 
+    def set_if_absent(self, key: str, record: IdempotencyRecord) -> bool:
+        with self._lock:
+            existing = self._records.get(key)
+            if existing is not None and time.time() - existing.timestamp <= existing.ttl:
+                return False
+            self._records[key] = record
+            return True
+
     def delete(self, key: str) -> bool:
         with self._lock:
             return self._records.pop(key, None) is not None
@@ -101,6 +123,110 @@ class MemoryBackend(IdempotencyBackend):
             for k in expired:
                 del self._records[k]
             return len(self._records)
+
+
+class RedisBackend(IdempotencyBackend):
+    """Distributed idempotency backend backed by Redis.
+
+    Enables cross-process / multi-worker deduplication. Requires the
+    optional ``redis`` package (``pip install redis``). Records expire
+    via Redis' native TTL.
+
+    Usage:
+        guard = IdempotencyGuard(backend=RedisBackend(url="redis://localhost:6379/0"))
+        # or pass an existing client:
+        guard = IdempotencyGuard(backend=RedisBackend(client=my_redis))
+    """
+
+    def __init__(
+        self,
+        client: Any = None,
+        url: str = "redis://localhost:6379/0",
+        namespace: str = "warderbox:idem",
+    ) -> None:
+        if client is None:
+            try:
+                import redis
+            except ImportError as e:  # pragma: no cover - optional dep
+                raise ImportError(
+                    "RedisBackend requires the 'redis' package. "
+                    "Install it with: pip install redis"
+                ) from e
+            client = redis.Redis.from_url(url)
+        self._r = client
+        self._ns = namespace
+
+    def _k(self, key: str) -> str:
+        return f"{self._ns}:rec:{key}"
+
+    def _tool_index(self, tool_name: str) -> str:
+        return f"{self._ns}:tool:{tool_name}"
+
+    @staticmethod
+    def _decode(value: Any) -> str:
+        return value.decode() if isinstance(value, bytes) else value
+
+    def get(self, key: str) -> IdempotencyRecord | None:
+        raw = self._r.get(self._k(key))
+        if raw is None:
+            return None
+        data = json.loads(self._decode(raw))
+        return IdempotencyRecord(**data)
+
+    def set(self, key: str, record: IdempotencyRecord) -> None:
+        data = {
+            "key": record.key,
+            "tool_name": record.tool_name,
+            "args_hash": record.args_hash,
+            "result": record.result,
+            "timestamp": record.timestamp,
+            "ttl": record.ttl,
+            "in_flight": record.in_flight,
+        }
+        ttl = max(1, int(record.ttl))
+        self._r.set(self._k(key), json.dumps(data, default=str), ex=ttl)
+        self._r.sadd(self._tool_index(record.tool_name), key)
+        self._r.expire(self._tool_index(record.tool_name), ttl)
+
+    def set_if_absent(self, key: str, record: IdempotencyRecord) -> bool:
+        data = {
+            "key": record.key,
+            "tool_name": record.tool_name,
+            "args_hash": record.args_hash,
+            "result": record.result,
+            "timestamp": record.timestamp,
+            "ttl": record.ttl,
+            "in_flight": record.in_flight,
+        }
+        ttl = max(1, int(record.ttl))
+        # Redis SET NX gives true cross-process atomicity.
+        stored = self._r.set(
+            self._k(key), json.dumps(data, default=str), nx=True, ex=ttl
+        )
+        if stored:
+            self._r.sadd(self._tool_index(record.tool_name), key)
+            self._r.expire(self._tool_index(record.tool_name), ttl)
+        return bool(stored)
+
+    def delete(self, key: str) -> bool:
+        return bool(self._r.delete(self._k(key)))
+
+    def clear(self, tool_name: str | None = None) -> int:
+        if tool_name is None:
+            keys = list(self._r.scan_iter(f"{self._ns}:rec:*"))
+            if keys:
+                self._r.delete(*keys)
+            return len(keys)
+        members = self._r.smembers(self._tool_index(tool_name))
+        count = 0
+        for m in members:
+            if self._r.delete(self._k(self._decode(m))):
+                count += 1
+        self._r.delete(self._tool_index(tool_name))
+        return count
+
+    def count(self) -> int:
+        return sum(1 for _ in self._r.scan_iter(f"{self._ns}:rec:*"))
 
 
 class IdempotencyGuard:
@@ -215,6 +341,75 @@ class IdempotencyGuard:
         )
         self._backend.set(key, entry)
         return key
+
+    def _key_for(self, tool_name: str, args: dict, idempotency_key: str | None) -> str:
+        if idempotency_key is not None:
+            return f"{tool_name}:{idempotency_key}"
+        return self._make_key(tool_name, self._hash_args(args))
+
+    def begin(
+        self,
+        tool_name: str,
+        args: dict,
+        idempotency_key: str | None = None,
+    ) -> tuple[DedupeResult, Any | None]:
+        """Atomically reserve an in-flight slot for a protected tool.
+
+        Returns (ALLOWED, None) when the caller won the reservation and may
+        execute, or (DUPLICATE, cached) when a completed or in-flight record
+        already exists. This closes the check-then-act race so concurrent
+        calls and caller-level retries cannot double-execute a side effect.
+        """
+        if tool_name not in self._protected_tools:
+            return DedupeResult.ALLOWED, None
+
+        key = self._key_for(tool_name, args, idempotency_key)
+        marker = IdempotencyRecord(
+            key=key,
+            tool_name=tool_name,
+            args_hash=key,
+            result=None,
+            ttl=self._default_ttl,
+            in_flight=True,
+        )
+        if self._backend.set_if_absent(key, marker):
+            return DedupeResult.ALLOWED, None
+
+        existing = self._backend.get(key)
+        with self._lock:
+            self._duplicates_blocked += 1
+        return DedupeResult.DUPLICATE, existing.result if existing else None
+
+    def complete(
+        self,
+        tool_name: str,
+        args: dict,
+        result: Any = None,
+        ttl: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> str:
+        """Finalize a reserved slot with the real result."""
+        return self.record(
+            tool_name, args, result=result, ttl=ttl, idempotency_key=idempotency_key
+        )
+
+    def fail(
+        self,
+        tool_name: str,
+        args: dict,
+        keep: bool = True,
+        idempotency_key: str | None = None,
+    ) -> None:
+        """Resolve a reserved slot after a failed execution.
+
+        By default the in-flight marker is *kept*, so a caller retry with the
+        same arguments is blocked — the side effect may already have landed
+        (e.g. a payment that committed before the response timed out). Pass
+        keep=False only for tools known to have no side effect before failure.
+        """
+        if not keep:
+            key = self._key_for(tool_name, args, idempotency_key)
+            self._backend.delete(key)
 
     def invalidate(
         self,

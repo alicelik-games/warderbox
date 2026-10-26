@@ -130,8 +130,7 @@ def main():
     # -- Cost Estimation (self-improving) --
     print("\n9. Pre-execution cost estimation:")
     plan = ["list_users", "add_user", "run_sql"]
-    estimate = shield.estimate(plan)
-    est = estimate.summary()
+    est = shield.estimate(plan)
     print(f"   Plan: {plan}")
     print(f"   Expected cost: ${est['cost']['expected']}")
     print(f"   Worst case:    ${est['cost']['worst']}")

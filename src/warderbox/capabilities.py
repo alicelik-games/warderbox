@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -52,8 +53,10 @@ class AgentCapability:
 class CapabilityManager:
     """Manages per-agent tool permissions."""
 
-    def __init__(self) -> None:
+    def __init__(self, fail_closed: bool = True) -> None:
         self._agents: dict[str, AgentCapability] = {}
+        self._fail_closed = fail_closed
+        self._lock = threading.Lock()
 
     def grant(
         self,
@@ -157,35 +160,40 @@ class CapabilityManager:
         args: dict | None = None,
         cost: float = 0.0,
     ) -> tuple[bool, str | None]:
-        if agent_name not in self._agents:
+        with self._lock:
+            if agent_name not in self._agents:
+                if self._fail_closed:
+                    return False, (
+                        f"Unknown agent '{agent_name}' has no capabilities granted"
+                    )
+                return True, None
+
+            cap = self._agents[agent_name]
+            cap._total_calls += 1
+
+            if tool_name in cap.deny:
+                cap._denied_calls += 1
+                return False, f"Agent '{agent_name}' denied access to '{tool_name}'"
+
+            if cap.allow is not None and tool_name not in cap.allow:
+                cap._denied_calls += 1
+                return False, f"Agent '{agent_name}' not allowed to use '{tool_name}'"
+
+            if cap.schedule:
+                ok, reason = self._check_schedule(cap.schedule)
+                if not ok:
+                    cap._denied_calls += 1
+                    return False, reason
+
+            if tool_name in cap.constraints:
+                constraint = cap.constraints[tool_name]
+                ok, reason = self._check_constraint(constraint, tool_name, args, cost)
+                if not ok:
+                    cap._denied_calls += 1
+                    return False, reason
+                constraint._call_times.append(time.time())
+
             return True, None
-
-        cap = self._agents[agent_name]
-        cap._total_calls += 1
-
-        if tool_name in cap.deny:
-            cap._denied_calls += 1
-            return False, f"Agent '{agent_name}' denied access to '{tool_name}'"
-
-        if cap.allow is not None and tool_name not in cap.allow:
-            cap._denied_calls += 1
-            return False, f"Agent '{agent_name}' not allowed to use '{tool_name}'"
-
-        if cap.schedule:
-            ok, reason = self._check_schedule(cap.schedule)
-            if not ok:
-                cap._denied_calls += 1
-                return False, reason
-
-        if tool_name in cap.constraints:
-            constraint = cap.constraints[tool_name]
-            ok, reason = self._check_constraint(constraint, tool_name, args, cost)
-            if not ok:
-                cap._denied_calls += 1
-                return False, reason
-            constraint._call_times.append(time.time())
-
-        return True, None
 
     def get_allowed_tools(self, agent_name: str) -> set[str] | None:
         if agent_name not in self._agents:

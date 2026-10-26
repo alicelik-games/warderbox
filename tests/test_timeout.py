@@ -1,8 +1,10 @@
 """Tests for execution timeout enforcement."""
 
 import time
+
 import pytest
-from warderbox.timeout import TimeoutExecutor, TimeoutPolicy, TimeoutError
+
+from warderbox.timeout import TimeoutError, TimeoutExecutor, TimeoutPolicy
 
 
 def test_normal_execution():

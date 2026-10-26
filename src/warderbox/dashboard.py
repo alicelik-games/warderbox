@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import json
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from warderbox.shield import WarderBox
-    from warderbox.routing import ModelRouter
     from warderbox.anomaly import AnomalyDetector
+    from warderbox.routing import ModelRouter
+    from warderbox.shield import WarderBox
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -265,8 +265,14 @@ function barColor(i) {
   return colors[i % colors.length];
 }
 
+function esc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+  ));
+}
+
 function modelChip(model, idx) {
-  return `<span class="model-chip model-chip-${Math.min(idx, 2)}">${model}</span>`;
+  return `<span class="model-chip model-chip-${Math.min(idx, 2)}">${esc(model)}</span>`;
 }
 
 async function refresh() {
@@ -306,7 +312,8 @@ async function refresh() {
       const status = h.blocked ? 'blocked' : (h.success ? 'ok' : 'error');
       const label = h.blocked ? 'BLOCKED' : (h.success ? 'OK' : 'ERROR');
       const t = new Date(h.timestamp * 1000).toLocaleTimeString();
-      return `<tr><td>${h.tool}</td><td>${h.risk.toUpperCase()}</td>
+      const toolLabel = h.fallback ? `${h.tool} → ${h.fallback}` : h.tool;
+      return `<tr><td>${esc(toolLabel)}</td><td>${esc(String(h.risk).toUpperCase())}</td>
         <td><span class="status status-${status}">${label}</span></td>
         <td>$${h.cost.toFixed(4)}</td><td>${t}</td></tr>`;
     }).join('');
@@ -336,7 +343,7 @@ async function refresh() {
     document.getElementById('cost-by-tool').innerHTML = tools.length ? tools.map((t, i) => {
       const pct = (t[1] / maxCost * 100).toFixed(0);
       return `<div class="cost-bar-row">
-        <span class="cost-bar-label">${t[0]}</span>
+        <span class="cost-bar-label">${esc(t[0])}</span>
         <div class="cost-bar-track"><div class="cost-bar-fill" style="width:${pct}%;background:${barColor(i)}">${pct > 15 ? '$' + t[1].toFixed(4) : ''}</div></div>
         <span class="cost-bar-value">$${t[1].toFixed(4)}</span></div>`;
     }).join('') : '<div class="empty-state">No cost data yet</div>';
@@ -355,7 +362,7 @@ async function refresh() {
       const share = totalCost > 0 ? (t[1] / totalCost * 100).toFixed(1) : '0.0';
       const count = d.tool_actions ? (d.tool_actions[t[0]] || 0) : '-';
       const avg = count > 0 ? (t[1] / count).toFixed(4) : '-';
-      return `<tr><td>${t[0]}</td><td>$${t[1].toFixed(4)}</td><td>${count}</td><td>$${avg}</td><td>${share}%</td></tr>`;
+      return `<tr><td>${esc(t[0])}</td><td>$${t[1].toFixed(4)}</td><td>${count}</td><td>$${avg}</td><td>${share}%</td></tr>`;
     }).join('') || '<tr><td colspan="5" class="empty-state">No data</td></tr>';
   } catch(e) {}
 
@@ -400,9 +407,9 @@ async function refresh() {
 
       // Recent decisions
       document.getElementById('routing-body').innerHTML = d.recent.map((r, i) => {
-        return `<tr><td>${modelChip(r.model, 0)}</td><td>${r.complexity.toUpperCase()}</td>
+        return `<tr><td>${modelChip(r.model, 0)}</td><td>${esc(String(r.complexity).toUpperCase())}</td>
           <td>${r.complexity_score.toFixed(3)}</td><td>$${r.estimated_cost_per_1k.toFixed(5)}</td>
-          <td style="font-size:12px">${r.reason}</td></tr>`;
+          <td style="font-size:12px">${esc(r.reason)}</td></tr>`;
       }).join('') || '<tr><td colspan="5" class="empty-state">No routing decisions</td></tr>';
     } else {
       document.getElementById('routing-stats').innerHTML = '<div class="card" style="grid-column:1/-1"><div class="empty-state">Model routing not configured. Attach a ModelRouter to enable.</div></div>';
@@ -442,7 +449,7 @@ async function refresh() {
         const pct = (t[1].confidence * 100).toFixed(0);
         const clr = t[1].confidence >= 0.95 ? 'var(--green)' : t[1].confidence >= 0.8 ? 'var(--cyan)' : t[1].confidence >= 0.5 ? 'var(--yellow)' : 'var(--orange)';
         return `<div class="cost-bar-row">
-          <span class="cost-bar-label">${t[0]}</span>
+          <span class="cost-bar-label">${esc(t[0])}</span>
           <div class="cost-bar-track"><div class="cost-bar-fill" style="width:${pct}%;background:${clr}">${pct > 15 ? pct + '%' : ''}</div></div>
           <span class="cost-bar-value">${pct}%</span></div>`;
       }).join('') : '<div class="empty-state">No tools tracked yet</div>';
@@ -473,7 +480,7 @@ async function refresh() {
         const s = t[1];
         const confPct = (s.confidence * 100).toFixed(0);
         const confClr = s.confidence >= 0.95 ? 'green' : s.confidence >= 0.8 ? 'cyan' : s.confidence >= 0.5 ? 'yellow' : 'orange';
-        return `<tr><td>${t[0]}</td><td>${s.total_calls}</td>
+        return `<tr><td>${esc(t[0])}</td><td>${s.total_calls}</td>
           <td><span class="${confClr}">${confPct}%</span>
             <div class="conf-bar"><div class="conf-fill" style="width:${confPct}%;background:var(--${confClr})"></div></div></td>
           <td>$${s.avg_cost.toFixed(4)}</td><td>${s.avg_duration.toFixed(2)}s</td>
@@ -497,10 +504,10 @@ async function refresh() {
 
     document.getElementById('alert-list').innerHTML = d.alerts.length ? d.alerts.slice(-30).reverse().map(a => {
       const t = new Date(a.timestamp * 1000).toLocaleString();
-      return `<div class="alert-item ${a.severity}">
-        <div class="alert-type">${a.type} &middot; ${a.severity}</div>
-        <div class="alert-msg">${a.message}</div>
-        <div class="alert-time">${t}${a.tool_name ? ' &middot; ' + a.tool_name : ''}</div></div>`;
+      return `<div class="alert-item ${esc(a.severity)}">
+        <div class="alert-type">${esc(a.type)} &middot; ${esc(a.severity)}</div>
+        <div class="alert-msg">${esc(a.message)}</div>
+        <div class="alert-time">${t}${a.tool_name ? ' &middot; ' + esc(a.tool_name) : ''}</div></div>`;
     }).join('') : '<div class="empty-state">No anomalies detected</div>';
   } catch(e) {}
 }
@@ -547,7 +554,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
         tool_actions: dict[str, int] = {}
         for h in self.shield.history():
-            tool = h["tool"]
+            tool = h.get("fallback") or h["tool"]
             tool_actions[tool] = tool_actions.get(tool, 0) + 1
 
         return {
@@ -593,7 +600,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     def _respond(self, code: int, content_type: str, body: str):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # Same-origin only: the dashboard serves local audit data, so we do
+        # not advertise CORS access to arbitrary web origins.
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body.encode("utf-8"))
 
@@ -609,7 +618,7 @@ def start_dashboard(
     background: bool = True,
     router: ModelRouter | None = None,
     anomaly_detector: AnomalyDetector | None = None,
-) -> HTTPServer:
+) -> ThreadingHTTPServer:
     """Start the WarderBox web dashboard.
 
     Args:
@@ -629,7 +638,7 @@ def start_dashboard(
         "router": router,
         "anomaly_detector": anomaly_detector,
     })
-    server = HTTPServer((host, port), handler)
+    server = ThreadingHTTPServer((host, port), handler)
 
     if background:
         thread = threading.Thread(target=server.serve_forever, daemon=True)

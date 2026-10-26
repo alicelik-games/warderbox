@@ -1,6 +1,5 @@
 """Tests for rollback transparency — reversible flag on tool decorator."""
 
-import pytest
 from warderbox import WarderBox
 
 

@@ -1,16 +1,14 @@
 """Tests for Phase 6: data masking, action replay."""
 
-import json
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, "src")
 
-from warderbox import WarderBox, DataMasker
-from warderbox.masking import DataMasker, DEFAULT_PATTERNS
+from warderbox import DataMasker, WarderBox
+from warderbox.masking import DataMasker
 from warderbox.replay import ActionReplayer
-
 
 # -- Data Masking --
 

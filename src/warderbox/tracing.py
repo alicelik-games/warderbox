@@ -1,8 +1,8 @@
 """Distributed tracing for AI agent actions.
 
-OpenTelemetry-compatible span system that tracks every action through
+OpenTelemetry-style span system that tracks every action through
 the shield pipeline. Zero dependency — generates trace/span IDs and
-exports JSON or OTLP-compatible format.
+exports a JSON span format (and an OTLP-shaped JSON view).
 
 Usage:
     tracer = Tracer()
@@ -23,8 +23,10 @@ Usage:
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -79,10 +81,13 @@ class Span:
 class Tracer:
     """Lightweight tracing system for agent actions."""
 
-    def __init__(self, service_name: str = "warderbox") -> None:
+    def __init__(
+        self, service_name: str = "warderbox", max_spans: int = 100_000
+    ) -> None:
         self._service_name = service_name
-        self._spans: list[Span] = []
+        self._spans: deque[Span] = deque(maxlen=max_spans)
         self._active_trace_id: str | None = None
+        self._lock = threading.Lock()
 
     def start_span(
         self,
@@ -101,7 +106,8 @@ class Tracer:
             attributes=attributes or {},
         )
         s.set_attribute("service.name", self._service_name)
-        self._spans.append(s)
+        with self._lock:
+            self._spans.append(s)
         return s
 
     def end_span(self, span: Span, status: str = "ok") -> None:
@@ -173,14 +179,19 @@ class Tracer:
         s.status = result_status
         return s
 
+    def _snapshot(self) -> list[Span]:
+        with self._lock:
+            return list(self._spans)
+
     def spans(self, trace_id: str | None = None) -> list[Span]:
+        snap = self._snapshot()
         if trace_id:
-            return [s for s in self._spans if s.trace_id == trace_id]
-        return list(self._spans)
+            return [s for s in snap if s.trace_id == trace_id]
+        return snap
 
     def traces(self) -> dict[str, list[Span]]:
         grouped: dict[str, list[Span]] = {}
-        for s in self._spans:
+        for s in self._snapshot():
             grouped.setdefault(s.trace_id, []).append(s)
         return grouped
 
@@ -190,7 +201,7 @@ class Tracer:
                 "resource": {"attributes": {"service.name": self._service_name}},
                 "scopeSpans": [{
                     "scope": {"name": "warderbox"},
-                    "spans": [s.to_dict() for s in self._spans],
+                    "spans": [s.to_dict() for s in self._snapshot()],
                 }],
             }]
         }
@@ -207,7 +218,7 @@ class Tracer:
                 },
                 "scopeSpans": [{
                     "scope": {"name": "warderbox"},
-                    "spans": [self._span_to_otlp(s) for s in self._spans],
+                    "spans": [self._span_to_otlp(s) for s in self._snapshot()],
                 }],
             }]
         }
@@ -239,15 +250,17 @@ class Tracer:
         return {"stringValue": str(v)}
 
     def clear(self) -> None:
-        self._spans.clear()
+        with self._lock:
+            self._spans.clear()
         self._active_trace_id = None
 
     def stats(self) -> dict:
-        total = len(self._spans)
-        errors = sum(1 for s in self._spans if s.status == "error")
+        snap = self._snapshot()
+        total = len(snap)
+        errors = sum(1 for s in snap if s.status == "error")
         avg_duration = 0.0
         if total:
-            avg_duration = sum(s.duration_ms for s in self._spans) / total
+            avg_duration = sum(s.duration_ms for s in snap) / total
         return {
             "total_spans": total,
             "traces": len(self.traces()),

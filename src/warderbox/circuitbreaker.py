@@ -18,8 +18,9 @@ Usage:
 
 from __future__ import annotations
 
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -55,6 +56,9 @@ class CircuitBreaker:
         self._on_open = on_open
         self._on_close = on_close
         self._circuits: dict[str, ToolCircuit] = {}
+        # Reentrant so on_open/on_close callbacks may call back into the
+        # breaker (e.g. read get_state) without deadlocking.
+        self._lock = threading.RLock()
 
     def _get(self, tool_name: str) -> ToolCircuit:
         if tool_name not in self._circuits:
@@ -70,81 +74,107 @@ class CircuitBreaker:
             circuit.half_open_admitted = False
 
     def is_open(self, tool_name: str) -> bool:
-        circuit = self._get(tool_name)
-        self._check_half_open(circuit)
-        return circuit.state == CircuitState.OPEN
+        with self._lock:
+            circuit = self._get(tool_name)
+            self._check_half_open(circuit)
+            return circuit.state == CircuitState.OPEN
 
     def should_allow(self, tool_name: str) -> tuple[bool, str | None]:
-        circuit = self._get(tool_name)
-        self._check_half_open(circuit)
+        with self._lock:
+            circuit = self._get(tool_name)
+            self._check_half_open(circuit)
 
-        if circuit.state == CircuitState.CLOSED:
-            return True, None
-
-        if circuit.state == CircuitState.HALF_OPEN:
-            if not circuit.half_open_admitted:
-                circuit.half_open_admitted = True
+            if circuit.state == CircuitState.CLOSED:
                 return True, None
-            return False, f"Circuit half-open for '{tool_name}', probe in progress"
 
-        return False, (
-            f"Circuit open for '{tool_name}': "
-            f"{circuit.failure_count} consecutive failures"
-        )
+            if circuit.state == CircuitState.HALF_OPEN:
+                if not circuit.half_open_admitted:
+                    circuit.half_open_admitted = True
+                    return True, None
+                return False, f"Circuit half-open for '{tool_name}', probe in progress"
+
+            return False, (
+                f"Circuit open for '{tool_name}': "
+                f"{circuit.failure_count} consecutive failures"
+            )
 
     def record_success(self, tool_name: str) -> None:
-        circuit = self._get(tool_name)
+        fire_close = False
+        with self._lock:
+            circuit = self._get(tool_name)
 
-        if circuit.state == CircuitState.HALF_OPEN:
-            circuit.success_count += 1
-            if circuit.success_count >= self._success_threshold:
-                circuit.state = CircuitState.CLOSED
+            if circuit.state == CircuitState.HALF_OPEN:
+                circuit.success_count += 1
+                if circuit.success_count >= self._success_threshold:
+                    circuit.state = CircuitState.CLOSED
+                    circuit.failure_count = 0
+                    circuit.success_count = 0
+                    circuit.half_open_admitted = False
+                    fire_close = True
+                else:
+                    # Probe succeeded but more are needed: admit the next one
+                    # instead of locking the circuit in HALF_OPEN forever.
+                    circuit.half_open_admitted = False
+            else:
                 circuit.failure_count = 0
                 circuit.success_count = 0
-                if self._on_close:
-                    self._on_close(tool_name)
-        else:
-            circuit.failure_count = 0
-            circuit.success_count = 0
+        # Callbacks run OUTSIDE the lock so a slow/other-thread callback does
+        # not stall concurrent breaker calls, and in try/except so a faulty
+        # callback never corrupts the result of the call that triggered it.
+        if fire_close and self._on_close:
+            self._safe_callback(self._on_close, tool_name)
 
     def record_failure(self, tool_name: str) -> None:
-        circuit = self._get(tool_name)
+        fire_open = False
+        with self._lock:
+            circuit = self._get(tool_name)
 
-        if circuit.state == CircuitState.HALF_OPEN:
-            circuit.state = CircuitState.OPEN
-            circuit.last_failure_time = time.time()
-            circuit.success_count = 0
-            if self._on_open:
-                self._on_open(tool_name)
-            return
+            if circuit.state == CircuitState.HALF_OPEN:
+                circuit.state = CircuitState.OPEN
+                circuit.last_failure_time = time.time()
+                circuit.success_count = 0
+                circuit.half_open_admitted = False
+                fire_open = True
+            else:
+                circuit.failure_count += 1
+                circuit.last_failure_time = time.time()
+                if circuit.failure_count >= self._failure_threshold:
+                    circuit.state = CircuitState.OPEN
+                    fire_open = True
 
-        circuit.failure_count += 1
-        circuit.last_failure_time = time.time()
+        if fire_open and self._on_open:
+            self._safe_callback(self._on_open, tool_name)
 
-        if circuit.failure_count >= self._failure_threshold:
-            circuit.state = CircuitState.OPEN
-            if self._on_open:
-                self._on_open(tool_name)
+    @staticmethod
+    def _safe_callback(cb, tool_name: str) -> None:
+        try:
+            cb(tool_name)
+        except Exception:
+            pass
 
     def get_state(self, tool_name: str) -> CircuitState:
-        circuit = self._get(tool_name)
-        self._check_half_open(circuit)
-        return circuit.state
+        with self._lock:
+            circuit = self._get(tool_name)
+            self._check_half_open(circuit)
+            return circuit.state
 
     def reset(self, tool_name: str) -> None:
-        if tool_name in self._circuits:
-            self._circuits[tool_name] = ToolCircuit()
+        with self._lock:
+            if tool_name in self._circuits:
+                self._circuits[tool_name] = ToolCircuit()
 
     def reset_all(self) -> None:
-        self._circuits.clear()
+        with self._lock:
+            self._circuits.clear()
 
     def stats(self) -> dict[str, dict]:
-        result = {}
-        for name, circuit in self._circuits.items():
-            self._check_half_open(circuit)
-            result[name] = {
-                "state": circuit.state.value,
-                "failure_count": circuit.failure_count,
-                "success_count": circuit.success_count,
-            }
-        return result
+        with self._lock:
+            result = {}
+            for name, circuit in self._circuits.items():
+                self._check_half_open(circuit)
+                result[name] = {
+                    "state": circuit.state.value,
+                    "failure_count": circuit.failure_count,
+                    "success_count": circuit.success_count,
+                }
+            return result

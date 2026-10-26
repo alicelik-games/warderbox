@@ -1,16 +1,14 @@
 """Tests for Phase 5: multi-agent, AutoGen, Prometheus metrics."""
 
-import json
 import sys
 import urllib.request
 
 sys.path.insert(0, "src")
 
-from warderbox import WarderBox, AgentPool
+from warderbox import AgentPool, WarderBox
+from warderbox.integrations.autogen import AutoGenShieldProxy, shield_autogen_functions
+from warderbox.metrics import multiagent_metrics, prometheus_metrics, start_metrics_server
 from warderbox.multiagent import AgentPool
-from warderbox.integrations.autogen import shield_autogen_functions, AutoGenShieldProxy
-from warderbox.metrics import prometheus_metrics, start_metrics_server, multiagent_metrics
-
 
 # -- Multi-agent --
 

@@ -14,44 +14,34 @@ import threading
 import time
 import urllib.request
 
-import pytest
-
 from warderbox import (
-    WarderBox,
-    AsyncWarderBox,
     AgentPool,
     AgentScorer,
-    PoolScorer,
+    AnomalyDetector,
+    AnomalyType,
     ApprovalManager,
-    Action,
-    ActionResult,
     CapabilityManager,
     ChaosEngine,
     CircuitBreaker,
     CircuitState,
     ComplianceReporter,
     CostForecaster,
-    FaultType,
-    RiskLevel,
-    ActionLogger,
     DataMasker,
-    RateLimiter,
-    ToolLimit,
-    RetryPolicy,
-    Tracer,
     EventNotifier,
+    FaultType,
     ModelRouter,
-    ComplexityClassifier,
-    Complexity,
-    AnomalyDetector,
-    AnomalyType,
-    AnomalyAlert,
+    PoolScorer,
+    RateLimiter,
+    RetryPolicy,
+    RiskLevel,
+    ToolLimit,
+    Tracer,
+    WarderBox,
     load_policy,
-    validate_policy,
     rules_from_config,
+    validate_policy,
 )
 from warderbox.dashboard import start_dashboard
-
 
 # ============================================================
 # Helpers
@@ -390,17 +380,22 @@ def test_20_rate_limiter_prune():
 # ============================================================
 
 def test_21_approval_blocks_pending():
-    approver = ApprovalManager(default_timeout=0.1)
-    approver.require_approval("send_email")
+    approver = ApprovalManager(default_timeout=0.05)
+    approver.require_approval("send_email", auto_deny=True)
     shield = WarderBox(budget=5.0)
     shield.set_approval(approver)
 
+    ran = []
+
     @shield.tool(cost=0.01)
     def send_email(to: str) -> str:
+        ran.append(to)
         return f"sent to {to}"
 
     result = send_email(to="user@test.com")
-    assert result.blocked or result.success
+    # No approver responded -> auto-deny on timeout -> blocked, tool never ran.
+    assert result.blocked is True
+    assert ran == []
 
 
 def test_22_capabilities_allow_deny():
@@ -459,37 +454,44 @@ def test_24_capabilities_max_cost():
 
 
 def test_25_capabilities_revoke():
+    # After all capabilities are revoked the agent is unknown again and,
+    # under the secure fail-closed default, must be denied.
     caps = CapabilityManager()
     caps.grant("bot", allow=["tool_a"])
     caps.revoke("bot")
-    shield = WarderBox(budget=5.0)
+    shield = WarderBox(budget=5.0, agent_name="bot")
     shield.set_capabilities(caps)
-    shield._agent_name = "bot"
 
     @shield.tool(cost=0.01)
     def tool_a() -> str:
         return "ok"
 
     result = tool_a()
-    assert result.success
+    assert result.blocked
 
 
 def test_26_approval_with_capabilities():
+    # Capability allows the tool, but an un-answered approval policy must
+    # still gate it: both checks have to pass.
     caps = CapabilityManager()
     caps.grant("bot", allow=["action"])
-    approver = ApprovalManager(default_timeout=0.01)
+    approver = ApprovalManager(default_timeout=0.05)
+    approver.require_approval("action", auto_deny=True)
 
-    shield = WarderBox(budget=5.0)
+    shield = WarderBox(budget=5.0, agent_name="bot")
     shield.set_capabilities(caps)
     shield.set_approval(approver)
-    shield._agent_name = "bot"
+
+    ran = []
 
     @shield.tool(cost=0.01)
     def action() -> str:
+        ran.append(1)
         return "ok"
 
     result = action()
-    assert result.success
+    assert result.blocked is True
+    assert ran == []
 
 
 def test_27_capabilities_stats():
@@ -516,11 +518,16 @@ def test_29_approval_risk_based():
     assert "__risk__HIGH" in approver._policies
 
 
-def test_30_capabilities_unknown_agent_passes():
+def test_30_capabilities_unknown_agent_fails_closed():
     caps = CapabilityManager()
     caps.grant("known", allow=["tool"])
     ok, reason = caps.check("unknown_agent", "any_tool")
-    assert ok
+    assert not ok
+
+    permissive = CapabilityManager(fail_closed=False)
+    permissive.grant("known", allow=["tool"])
+    ok2, _ = permissive.check("unknown_agent", "any_tool")
+    assert ok2
 
 
 # ============================================================
@@ -1654,7 +1661,7 @@ def test_99_end_to_end_scenario():
 def test_100_version_and_exports():
     """Verify all public exports are accessible."""
     import warderbox
-    assert warderbox.__version__ == "0.3.5"
+    assert warderbox.__version__ == "0.3.6"
 
     required = [
         "WarderBox", "AsyncWarderBox", "AgentPool", "AgentScorer",

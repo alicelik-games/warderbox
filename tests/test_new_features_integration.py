@@ -1,14 +1,14 @@
 """Integration tests for the 5 new features (timeout, idempotency, output validation, fallback, quota)."""
 
-import time
 import threading
-from warderbox import WarderBox
-from warderbox.timeout import TimeoutExecutor, TimeoutPolicy
-from warderbox.idempotency import IdempotencyGuard
-from warderbox.output_validation import OutputValidator, OutputRule, OutputAction
-from warderbox.fallback import FallbackManager
-from warderbox.quota import QuotaManager, QuotaPeriod
+import time
 
+from warderbox import WarderBox
+from warderbox.fallback import FallbackManager
+from warderbox.idempotency import IdempotencyGuard
+from warderbox.output_validation import OutputAction, OutputRule, OutputValidator
+from warderbox.quota import QuotaManager, QuotaPeriod
+from warderbox.timeout import TimeoutExecutor, TimeoutPolicy
 
 # -- Timeout integration --
 
@@ -338,4 +338,4 @@ def test_concurrent_timeout_and_idempotency():
 
 def test_version():
     from warderbox import __version__
-    assert __version__ == "0.3.5"
+    assert __version__ == "0.3.6"

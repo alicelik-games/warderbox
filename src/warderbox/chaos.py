@@ -151,7 +151,10 @@ class ChaosEngine:
             event.details = f"Simulated timeout after {rule.latency_ms}ms"
             self._history.append(event)
             time.sleep(rule.latency_ms / 1000.0)
-            raise TimeoutError(f"[CHAOS] Simulated timeout for {tool_name}")
+            # Use WarderBox's TimeoutError so the pipeline treats this as a
+            # timeout (fires action_timeout), not a generic error.
+            from warderbox.timeout import TimeoutError as ToolTimeoutError
+            raise ToolTimeoutError(f"[CHAOS] Simulated timeout for {tool_name}")
 
         if rule.fault_type == FaultType.CORRUPT_OUTPUT:
             event.details = "Output will be corrupted"

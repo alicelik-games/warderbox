@@ -1,6 +1,5 @@
 """Tests for execution quotas."""
 
-import time
 from warderbox.quota import QuotaManager, QuotaPeriod
 
 

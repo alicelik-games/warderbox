@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -138,12 +138,15 @@ class ApprovalManager:
             self._pending[request_id] = event
 
         if self._on_request:
-            self._on_request(
-                request_id=request_id,
-                tool_name=tool_name,
-                args=args or {},
-                risk_level=risk_level,
-            )
+            try:
+                self._on_request(
+                    request_id=request_id,
+                    tool_name=tool_name,
+                    args=args or {},
+                    risk_level=risk_level,
+                )
+            except Exception:
+                pass  # notification callback must not abort the approval flow
 
         start = time.time()
         approved = event.wait(timeout=policy.timeout)
@@ -250,6 +253,11 @@ class ApprovalManager:
     def pending_count(self) -> int:
         with self._lock:
             return len(self._pending)
+
+    def pending_requests(self) -> list[str]:
+        """Return the ids of approval requests currently awaiting a decision."""
+        with self._lock:
+            return list(self._pending.keys())
 
     @property
     def history(self) -> list[ApprovalResult]:

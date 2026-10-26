@@ -1,14 +1,12 @@
 """Tests for smart model routing."""
 
 import pytest
-from warderbox.routing import (
-    ModelRouter,
-    ComplexityClassifier,
-    Complexity,
-    ModelTier,
-    RoutingDecision,
-)
 
+from warderbox.routing import (
+    Complexity,
+    ComplexityClassifier,
+    ModelRouter,
+)
 
 # --- ComplexityClassifier ---
 
