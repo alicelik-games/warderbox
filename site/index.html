@@ -150,7 +150,7 @@ footer { text-align: center; padding: 40px 24px; border-top: 1px solid var(--bor
       <div class="feature-card">
         <div class="icon">&#x23ea;</div>
         <h3>Instant Rollback</h3>
-        <p>Deep-copy state snapshots let you undo any action with a single call. Auto-snapshot on every tool execution.</p>
+        <p>Deep-copy state snapshots let you undo any action with a single call. Auto-snapshots any tool you give capture/restore functions.</p>
       </div>
       <div class="feature-card">
         <div class="icon">&#x26a1;</div>
@@ -210,12 +210,12 @@ footer { text-align: center; padding: 40px 24px; border-top: 1px solid var(--bor
       <div class="feature-card">
         <div class="icon">&#x1f4c8;</div>
         <h3>FinOps Dashboard</h3>
-        <p>Real-time 4-tab web UI: Overview, FinOps (cost breakdown), Routing (model stats), and Alerts (anomaly monitoring).</p>
+        <p>Real-time 5-tab web UI: Overview, FinOps (cost breakdown), Estimation (self-improving predictions), Routing (model stats), and Alerts (anomaly monitoring).</p>
       </div>
       <div class="feature-card">
         <div class="icon">&#x23f1;</div>
         <h3>Execution Timeout</h3>
-        <p>Hard deadline enforcement for tool calls. Per-tool timeout overrides. Kills hanging calls before they burn budget silently.</p>
+        <p>Hard deadline enforcement for tool calls. Per-tool timeout overrides. Stops waiting on hanging calls before they burn budget silently.</p>
       </div>
       <div class="feature-card">
         <div class="icon">&#x1f512;</div>
@@ -300,14 +300,14 @@ footer { text-align: center; padding: 40px 24px; border-top: 1px solid var(--bor
       <tr><td>Circuit Breaker</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="partial">Manual</td></tr>
       <tr><td>Rollback</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="partial">Manual</td></tr>
       <tr><td>Approval Workflows</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="partial">Manual</td></tr>
-      <tr><td>Distributed Tracing</td><td class="yes">OTel-compat</td><td class="no">No</td><td class="partial">Callbacks</td><td class="partial">Manual</td></tr>
+      <tr><td>Distributed Tracing</td><td class="yes">OTel-style</td><td class="no">No</td><td class="partial">Callbacks</td><td class="partial">Manual</td></tr>
       <tr><td>Chaos Testing</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="no">No</td></tr>
       <tr><td>Compliance Reports</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="partial">Manual</td></tr>
       <tr><td>Agent Scoring</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="no">No</td></tr>
       <tr><td>Multi-Agent Support</td><td class="yes">AgentPool</td><td class="no">No</td><td class="partial">Limited</td><td class="partial">Manual</td></tr>
       <tr><td>Smart Model Routing</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="partial">Manual</td></tr>
       <tr><td>Cost Anomaly Detection</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="no">No</td></tr>
-      <tr><td>FinOps Dashboard</td><td class="yes">4-tab UI</td><td class="no">No</td><td class="no">No</td><td class="no">No</td></tr>
+      <tr><td>FinOps Dashboard</td><td class="yes">5-tab UI</td><td class="no">No</td><td class="no">No</td><td class="no">No</td></tr>
       <tr><td>Execution Timeout</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="partial">Manual</td></tr>
       <tr><td>Idempotency Guard</td><td class="yes">Built-in</td><td class="no">No</td><td class="no">No</td><td class="no">No</td></tr>
       <tr><td>Output Validation</td><td class="yes">Built-in</td><td class="partial">Validators</td><td class="no">No</td><td class="partial">Manual</td></tr>
@@ -370,10 +370,10 @@ footer { text-align: center; padding: 40px 24px; border-top: 1px solid var(--bor
     </div>
     <div class="market-card">
       <h3>Gap in Market</h3>
-      <p>After Guardrails AI's acquisition, no independent, framework-agnostic agent safety platform exists.</p>
+      <p>Fills the gap between eval/observability tools and runtime action control — framework-agnostic, operating at the execution layer.</p>
     </div>
     <div class="market-card">
-      <h3>Enterprise-Ready</h3>
+      <h3>Built for Enterprise Adoption</h3>
       <p>Compliance reports, approval workflows, distributed tracing, and agent scoring built for enterprise adoption.</p>
     </div>
   </div>
