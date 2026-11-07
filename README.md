@@ -19,7 +19,7 @@ WarderBox intercepts every tool call your AI agent makes and provides rollback, 
 
 **Zero mandatory dependencies. One `pip install`. Works with 5 major agent frameworks — or plain Python.**
 
-> **Market context:** With Guardrails AI acquired by Harvey (Sept 2026) and the AI agent safety market projected to grow from $610M to $6.85B at 41% CAGR, WarderBox fills the gap as a comprehensive, framework-agnostic agent operations platform.
+> **Market context:** With Guardrails AI acquired by Harvey (Sept 2026) and the AI agent safety market projected to grow from \$610M to \$6.85B at 41% CAGR, WarderBox fills the gap as a comprehensive, framework-agnostic agent operations platform.
 
 ## Why WarderBox?
 
@@ -686,7 +686,7 @@ raises stops the call rather than letting it through.
 ### Shared limits across workers
 
 By default budget, rate-limit and quota counters live in process memory: four
-gunicorn workers with a $5 budget can spend $20. Give them a backend to share:
+gunicorn workers with a \$5 budget can spend \$20. Give them a backend to share:
 
 ```python
 from warderbox import RedisStateBackend, SQLiteStateBackend, WarderBox
