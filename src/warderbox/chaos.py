@@ -4,6 +4,10 @@ Inject controlled failures into agent tool calls to verify that the agent
 handles errors gracefully — circuit breakers trip, retries fire, budgets
 hold, and no data is lost.
 
+Faults fire only in test mode by default. Production injection requires an
+explicit ``ChaosEngine(allow_production=True)`` and raises a RuntimeWarning when
+attached; that option is for deliberate resilience drills, not normal use.
+
 Usage:
     chaos = ChaosEngine()
     shield.set_chaos(chaos)
@@ -24,6 +28,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import random
 import time
 from dataclasses import dataclass, field
@@ -66,15 +71,25 @@ class FaultEvent:
 class ChaosEngine:
     """Injects controlled faults into agent tool execution."""
 
-    def __init__(self, enabled: bool = True, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        seed: int | None = None,
+        allow_production: bool = False,
+    ) -> None:
         self._enabled = enabled
         self._rules: list[FaultRule] = []
         self._history: list[FaultEvent] = []
         self._rng = random.Random(seed)
+        self._allow_production = allow_production
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    @property
+    def allow_production(self) -> bool:
+        return self._allow_production
 
     def enable(self) -> None:
         self._enabled = True
@@ -127,39 +142,67 @@ class ChaosEngine:
 
         return None
 
-    def inject(self, rule: FaultRule, tool_name: str) -> None:
+    def _record(self, rule: FaultRule, tool_name: str, details: str) -> None:
         rule._injection_count += 1
-
-        event = FaultEvent(
+        self._history.append(FaultEvent(
             tool_name=tool_name,
             fault_type=rule.fault_type.value,
-        )
+            details=details,
+        ))
 
+    def _raise_for(self, rule: FaultRule, tool_name: str) -> None:
         if rule.fault_type == FaultType.ERROR:
-            event.details = rule.error_message
-            self._history.append(event)
             raise RuntimeError(f"[CHAOS] {rule.error_message}")
-
-        if rule.fault_type == FaultType.LATENCY:
-            delay = rule.latency_ms / 1000.0
-            event.details = f"Injected {rule.latency_ms}ms latency"
-            self._history.append(event)
-            time.sleep(delay)
-            return
-
         if rule.fault_type == FaultType.TIMEOUT:
-            event.details = f"Simulated timeout after {rule.latency_ms}ms"
-            self._history.append(event)
-            time.sleep(rule.latency_ms / 1000.0)
             # Use WarderBox's TimeoutError so the pipeline treats this as a
             # timeout (fires action_timeout), not a generic error.
             from warderbox.timeout import TimeoutError as ToolTimeoutError
             raise ToolTimeoutError(f"[CHAOS] Simulated timeout for {tool_name}")
 
-        if rule.fault_type == FaultType.CORRUPT_OUTPUT:
-            event.details = "Output will be corrupted"
-            self._history.append(event)
-            return
+    @staticmethod
+    def _describe(rule: FaultRule) -> str:
+        if rule.fault_type == FaultType.ERROR:
+            return rule.error_message
+        if rule.fault_type == FaultType.LATENCY:
+            return f"Injected {rule.latency_ms}ms latency"
+        if rule.fault_type == FaultType.TIMEOUT:
+            return f"Simulated timeout after {rule.latency_ms}ms"
+        return "Output will be corrupted"
+
+    @staticmethod
+    def _delay(rule: FaultRule) -> float:
+        if rule.fault_type in (FaultType.LATENCY, FaultType.TIMEOUT):
+            return rule.latency_ms / 1000.0
+        return 0.0
+
+    def inject(self, rule: FaultRule, tool_name: str) -> None:
+        """Apply a fault. Raises for ERROR/TIMEOUT, sleeps for LATENCY.
+
+        CORRUPT_OUTPUT does nothing here: the pipeline passes the tool's result
+        through :meth:`corrupt` after the tool runs.
+        """
+        self._record(rule, tool_name, self._describe(rule))
+        delay = self._delay(rule)
+        if delay:
+            time.sleep(delay)
+        self._raise_for(rule, tool_name)
+
+    async def ainject(self, rule: FaultRule, tool_name: str) -> None:
+        """Async :meth:`inject`: latency must not freeze the event loop."""
+        self._record(rule, tool_name, self._describe(rule))
+        delay = self._delay(rule)
+        if delay:
+            await asyncio.sleep(delay)
+        self._raise_for(rule, tool_name)
+
+    @staticmethod
+    def corrupt(output):
+        """Return a corrupted copy of a tool's output."""
+        if isinstance(output, str):
+            return f"[CORRUPTED] {output[::-1]}"
+        if isinstance(output, dict):
+            return {"__corrupted__": True, "original_keys": list(output.keys())}
+        return None
 
     def maybe_corrupt_output(self, tool_name: str, output):
         if not self._enabled:
@@ -169,11 +212,7 @@ class ChaosEngine:
             if rule.tool_name != tool_name and rule.tool_name != "*":
                 continue
             if rule.fault_type == FaultType.CORRUPT_OUTPUT and not rule.exhausted:
-                if isinstance(output, str):
-                    return f"[CORRUPTED] {output[::-1]}"
-                if isinstance(output, dict):
-                    return {"__corrupted__": True, "original_keys": list(output.keys())}
-                return None
+                return self.corrupt(output)
 
         return output
 

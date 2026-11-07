@@ -53,6 +53,13 @@ class SnapshotStore:
             return None
         return self._snapshots[-1]
 
+    def get_latest_unrestored(self) -> Snapshot | None:
+        """Return the newest snapshot that has not already been restored."""
+        for snap in reversed(self._snapshots):
+            if not snap.restored:
+                return snap
+        return None
+
     def get_by_action(self, action_id: str) -> Snapshot | None:
         for snap in reversed(self._snapshots):
             if snap.action_id == action_id:

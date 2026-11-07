@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from warderbox.state import StateBackendError
+
 
 @dataclass
 class CostForecast:
@@ -28,6 +30,9 @@ class CostForecast:
     estimated_exhaustion: datetime | None
     estimated_actions_remaining: int | None
     cost_by_tool: dict[str, float] = field(default_factory=dict)
+    # Share of spend backed by a provider report rather than a declared
+    # estimate. A low share means the forecast is projecting your own guesses.
+    actual_cost_share: float = 0.0
     trend: str = "stable"
 
     @property
@@ -70,6 +75,7 @@ class CostForecast:
             ),
             "estimated_actions_remaining": self.estimated_actions_remaining,
             "cost_by_tool": self.cost_by_tool,
+            "actual_cost_share": self.actual_cost_share,
             "trend": self.trend,
         }
 
@@ -80,6 +86,12 @@ class CostForecaster:
     def __init__(self, shield, min_window_seconds: float = 60.0) -> None:
         self._shield = shield
         self._min_window_seconds = min_window_seconds
+
+    def _spent(self) -> float:
+        try:
+            return self._shield._budget.spent
+        except StateBackendError:
+            return self._shield.budget_summary["spent"]
 
     def forecast(self) -> CostForecast:
         history = self._shield.history()
@@ -99,7 +111,7 @@ class CostForecaster:
                 estimated_actions_remaining=None,
             )
 
-        total_spent = self._shield._budget.spent
+        total_spent = self._spent()
         budget = self._shield._budget.budget
         remaining = budget - total_spent if budget else None
 
@@ -156,8 +168,20 @@ class CostForecaster:
             estimated_exhaustion=exhaustion,
             estimated_actions_remaining=actions_remaining,
             cost_by_tool=cost_by_tool,
+            actual_cost_share=self._actual_share(history),
             trend=trend,
         )
+
+    @staticmethod
+    def _actual_share(history: list[dict]) -> float:
+        total = sum(h["cost"] or 0.0 for h in history)
+        if total <= 0:
+            return 0.0
+        known = sum(
+            h["cost"] or 0.0 for h in history
+            if h.get("cost_source") in ("actual", "reconciled")
+        )
+        return round(known / total, 4)
 
     def _detect_trend(self, history: list[dict]) -> str:
         if len(history) < 4:

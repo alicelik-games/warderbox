@@ -1,7 +1,8 @@
 """Compliance and audit reporting for AI agent operations.
 
-Generates structured reports from SQLite action logs for SOC2, GDPR,
-and internal audit purposes.
+Generates structured reports from SQLite action logs, usable as evidence in
+internal audits and in SOC 2 or GDPR processes. Producing these reports does not
+make a system compliant with, or certified against, any standard.
 
 Usage:
     reporter = ComplianceReporter(db_path="audit.db")

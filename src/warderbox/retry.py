@@ -27,13 +27,23 @@ class RetryPolicy:
         backoff_max: Maximum delay cap in seconds.
         jitter: Add random jitter (0 to jitter seconds) to each delay.
         retry_on: Optional callable that takes the exception and returns
-                  True if this error should be retried. Default: retry all.
+                  True if this error should be retried. Default: retry all,
+                  timeouts included.
+        overlap_on_timeout: What a retry does when a thread-mode deadline
+                  passed and the first attempt is still running (a thread cannot
+                  be killed). False (default): the retry keeps waiting for that
+                  same attempt and uses its result, so a slow tool is never
+                  running twice at once. True: the retry starts a new attempt
+                  alongside it, for read-only tools that may simply hang.
+                  Process isolation always kills the old attempt and starts
+                  fresh, so this setting does not apply there.
     """
     max_retries: int = 3
     backoff_base: float = 1.0
     backoff_max: float = 30.0
     jitter: float = 0.5
     retry_on: Callable[[Exception], bool] | None = None
+    overlap_on_timeout: bool = False
 
     def should_retry(self, error: Exception, attempt: int) -> bool:
         if attempt >= self.max_retries:
@@ -98,7 +108,7 @@ async def async_execute_with_retry(
             return result, errors
         except Exception as e:
             errors.append(e)
-            if not policy.should_retry(e, attempt + 1):
+            if not policy.should_retry(e, attempt):
                 raise
             delay = policy.delay_for(attempt)
             await asyncio.sleep(delay)

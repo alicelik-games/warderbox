@@ -43,10 +43,14 @@ class AgentPool:
         default_budget: float | None = None,
         default_mode: str = "production",
         global_db_path: str | None = None,
+        audit_key: str | bytes | None = None,
+        require_audit_key: bool = False,
     ) -> None:
         self._default_budget = default_budget
         self._default_mode = default_mode
         self._global_db_path = global_db_path
+        self._audit_key = audit_key
+        self._require_audit_key = require_audit_key
         self._agents: dict[str, WarderBox] = {}
 
     def register(
@@ -59,6 +63,8 @@ class AgentPool:
         global_rph: int | None = None,
         tool_limits: dict[str, ToolLimit] | None = None,
         config: dict[str, Any] | None = None,
+        audit_key: str | bytes | None = None,
+        require_audit_key: bool | None = None,
     ) -> WarderBox:
         """Register a new agent with its own isolated shield.
 
@@ -81,6 +87,14 @@ class AgentPool:
                 merged["global_rpm"] = global_rpm
             if global_rph is not None:
                 merged["global_rph"] = global_rph
+            if audit_key is not None:
+                merged["audit_key"] = audit_key
+            elif self._audit_key is not None:
+                merged.setdefault("audit_key", self._audit_key)
+            if require_audit_key is not None:
+                merged["require_audit_key"] = require_audit_key
+            elif self._require_audit_key:
+                merged.setdefault("require_audit_key", True)
             shield = WarderBox.from_config(merged)
             shield._agent_name = name
         else:
@@ -92,6 +106,12 @@ class AgentPool:
                 global_rph=global_rph,
                 tool_limits=tool_limits,
                 agent_name=name,
+                audit_key=audit_key if audit_key is not None else self._audit_key,
+                require_audit_key=(
+                    require_audit_key
+                    if require_audit_key is not None
+                    else self._require_audit_key
+                ),
             )
 
         self._agents[name] = shield

@@ -309,7 +309,7 @@ def test_p2_async_def_with_sync_tool_warns():
 def test_p2_chaos_timeout_emits_timeout_event():
     from warderbox.chaos import ChaosEngine, FaultType
     s = WarderBox(budget=5.0)
-    chaos = ChaosEngine()
+    chaos = ChaosEngine(allow_production=True)
     chaos.add_fault("flaky", FaultType.TIMEOUT, probability=1.0, latency_ms=1)
     s.set_chaos(chaos)
     events = []

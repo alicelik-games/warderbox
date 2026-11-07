@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "warderbox"
-version = "0.3.6"
+version = "0.3.7"
 description = "AI agent safety platform: pre-execution cost estimation, execution timeout, idempotency guard, output validation, fallback routing, quotas, smart model routing, cost anomaly detection, rollback, budget control, circuit breakers, tracing, compliance, and chaos testing."
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -37,6 +37,8 @@ crewai = ["crewai>=0.1"]
 autogen = ["pyautogen>=0.2"]
 anthropic = ["anthropic>=0.18"]
 yaml = ["pyyaml>=6.0"]
+sql = ["sqlglot>=20.0"]
+redis = ["redis>=4.5"]
 all = [
     "openai>=1.0",
     "langchain-core>=0.1",
@@ -44,8 +46,10 @@ all = [
     "pyautogen>=0.2",
     "anthropic>=0.18",
     "pyyaml>=6.0",
+    "sqlglot>=20.0",
+    "redis>=4.5",
 ]
-dev = ["pytest>=7.0", "ruff>=0.1"]
+dev = ["pytest>=7.0", "ruff>=0.1", "sqlglot>=20.0", "redis>=4.5", "fakeredis[lua]>=2.20"]
 
 [project.scripts]
 warderbox = "warderbox.cli:main"
@@ -61,6 +65,7 @@ packages = ["src/warderbox"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py311"

@@ -47,7 +47,7 @@ def main():
     separator("1. Basic Shield: Risk Classification & Budget")
     # =========================================================
 
-    shield = WarderBox(budget=5.00, auto_snapshot=True, db_path=db_path)
+    shield = WarderBox(budget=5.00, auto_snapshot=True, db_path=db_path, audit_key="demo-audit-key")
 
     @shield.tool(cost=0.05, snapshot_state=lambda: dict(db_data), restore_state=lambda s: db_data.update(s))
     def query_db(sql: str) -> str:

@@ -27,6 +27,7 @@ from collections.abc import Callable
 from typing import Any
 
 from warderbox.action import Action, ActionResult
+from warderbox.integrations._messages import model_safe_error
 from warderbox.shield import WarderBox
 
 
@@ -92,7 +93,7 @@ class AnthropicShieldMiddleware:
                 block_reason=f"No executor registered for tool '{tool_name}'",
             )
 
-        return self._shield._execute(
+        return self._shield.execute(
             action=action,
             func=executor,
             args=(),
@@ -107,11 +108,9 @@ class AnthropicShieldMiddleware:
         Returns a dict suitable for the Messages API:
             {"type": "tool_result", "tool_use_id": ..., "content": ...}
         """
-        if result.blocked:
-            content = f"[BLOCKED] {result.block_reason}"
-            is_error = True
-        elif result.error:
-            content = f"[ERROR] {result.error}"
+        message = model_safe_error(result, self._shield)
+        if message is not None:
+            content = message
             is_error = True
         else:
             content = str(result.output) if result.output is not None else ""

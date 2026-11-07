@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from warderbox.logger import ActionLogger
+from warderbox.logger import ActionLogger, AuditKeyError
 from warderbox.policy import validate_policy
 
 
@@ -65,7 +65,9 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     from warderbox import WarderBox
     from warderbox.dashboard import start_dashboard
 
-    shield = WarderBox(db_path=args.db)
+    # The CLI dashboard only reads the audit log; it does not write, so a
+    # keyless read is safe even when the producer used an audit key.
+    shield = WarderBox(db_path=args.db, require_audit_key=False)
     loaded = shield.load_history_from_db()
 
     print(f"WarderBox Dashboard: http://127.0.0.1:{args.port} ({loaded} actions from {args.db})")
@@ -103,6 +105,14 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
+    try:
+        _run(args)
+    except AuditKeyError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _run(args: argparse.Namespace) -> None:
     commands = {
         "stats": cmd_stats,
         "logs": cmd_logs,

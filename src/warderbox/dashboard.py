@@ -11,7 +11,7 @@ Uses Python's built-in http.server. No external packages needed.
 Usage:
     from warderbox.dashboard import start_dashboard
 
-    shield = WarderBox(budget=10.0, db_path="audit.db")
+    shield = WarderBox(budget=10.0, db_path="audit.db", audit_key="local-audit-key")
     # ... register tools, do work ...
 
     start_dashboard(shield, port=8080)
@@ -295,6 +295,7 @@ async function refresh() {
     document.getElementById('budget-card').innerHTML = `
       <h3>Budget</h3>
       <div class="value">$${b.spent.toFixed(2)}</div>
+      ${d.degraded ? '<div class="sub">Shared state unavailable: this worker only</div>' : ''}
       <div class="sub">${b.budget ? 'of $' + b.budget.toFixed(2) + ' (' + pct.toFixed(0) + '%)' : 'No limit set'}</div>
       ${b.budget ? '<div class="budget-bar"><div class="budget-fill" style="width:'+pct+'%;background:'+bcolor+'"></div></div>' : ''}`;
     const rl = d.rate_limits;
@@ -524,6 +525,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     anomaly_detector: AnomalyDetector | None
 
     def do_GET(self):
+        try:
+            self._route()
+        except Exception as e:
+            # One failing panel must not take the connection down with it.
+            body = json.dumps({"error": type(e).__name__, "degraded": True})
+            self._respond(503, "application/json", body)
+
+    def _route(self):
         if self.path == "/" or self.path == "/index.html":
             self._respond(200, "text/html", _DASHBOARD_HTML)
         elif self.path == "/api/stats":

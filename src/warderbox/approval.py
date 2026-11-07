@@ -27,6 +27,12 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
+_RISK_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def _risk_rank(level: str) -> int:
+    return _RISK_RANK.get(str(level).upper(), 0)
+
 
 class ApprovalDecision(Enum):
     APPROVED = "approved"
@@ -107,10 +113,27 @@ class ApprovalManager:
     def needs_approval(self, tool_name: str, risk_level: str = "LOW") -> bool:
         if tool_name in self._policies:
             return True
-        risk_key = f"__risk__{risk_level.upper()}"
-        if risk_key in self._policies:
-            return True
-        return False
+        current = _risk_rank(risk_level)
+        return any(
+            policy.required_for_risk is not None
+            and _risk_rank(policy.required_for_risk) <= current
+            for policy in self._policies.values()
+        )
+
+    def _risk_policy(self, risk_level: str) -> ApprovalPolicy | None:
+        """Pick the strictest applicable risk threshold at or below *risk_level*."""
+        current = _risk_rank(risk_level)
+        candidates = [
+            policy for policy in self._policies.values()
+            if policy.required_for_risk is not None
+            and _risk_rank(policy.required_for_risk) <= current
+        ]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda policy: _risk_rank(policy.required_for_risk or "LOW"),
+        )
 
     def request_approval(
         self,
@@ -128,8 +151,7 @@ class ApprovalManager:
 
         policy = self._policies.get(tool_name)
         if not policy:
-            risk_key = f"__risk__{risk_level.upper()}"
-            policy = self._policies.get(risk_key, ApprovalPolicy())
+            policy = self._risk_policy(risk_level) or ApprovalPolicy()
 
         request_id = action_id or f"{tool_name}_{time.time()}"
 
@@ -201,10 +223,17 @@ class ApprovalManager:
                         elapsed=elapsed,
                     )
                 else:
+                    # auto_deny_on_timeout=False is not "approve"; it means
+                    # a human must still review the pending action. Surface
+                    # this explicitly so callers can route it to a queue
+                    # instead of silently treating it as a denial.
                     result = ApprovalResult(
-                        decision=ApprovalDecision.DENIED,
+                        decision=ApprovalDecision.ESCALATED,
                         tool_name=tool_name,
-                        reason="No approval received",
+                        reason=(
+                            "Approval timed out; auto-deny disabled, "
+                            "manual review required"
+                        ),
                         elapsed=elapsed,
                     )
 

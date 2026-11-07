@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from warderbox.state import StateBackend
+
 
 class QuotaPeriod(Enum):
     DAILY = "daily"
@@ -74,7 +76,16 @@ class QuotaManager:
         qm.record("send_email")
     """
 
-    def __init__(self, persist_path: str | None = None) -> None:
+    def __init__(
+        self,
+        persist_path: str | None = None,
+        backend: StateBackend | None = None,
+        namespace: str = "default",
+    ) -> None:
+        if persist_path and backend is not None:
+            raise ValueError("Use either persist_path or backend, not both")
+        self._backend = backend
+        self._namespace = namespace
         self._quotas: dict[str, list[QuotaUsage]] = {}
         self._lock = threading.Lock()
         # Optional durable backend: when set, quota counters survive process
@@ -82,6 +93,36 @@ class QuotaManager:
         self._persist_path = persist_path
         if persist_path:
             self._load()
+
+    def use_backend(self, backend: StateBackend, namespace: str = "default") -> None:
+        """Keep counters in shared state so quotas hold across workers."""
+        if self._persist_path:
+            raise ValueError("Use either persist_path or backend, not both")
+        self._backend = backend
+        self._namespace = namespace
+
+    @staticmethod
+    def _counter_key(usage: QuotaUsage, scope: str) -> str:
+        return f"quota:{scope}:{usage.limit.period.value}"
+
+    def _applicable(self, tool_name: str) -> list[tuple[str, QuotaUsage]]:
+        return [
+            (scope, usage)
+            for scope in (tool_name, "global")
+            for usage in self._quotas.get(scope, [])
+        ]
+
+    def _counter_checks(
+        self, applicable: list[tuple[str, QuotaUsage]]
+    ) -> list[tuple[str, int, float]]:
+        return [
+            (
+                self._counter_key(usage, scope),
+                usage.limit.max_calls,
+                float(PERIOD_SECONDS[usage.limit.period]),
+            )
+            for scope, usage in applicable
+        ]
 
     def set_quota(
         self,
@@ -153,8 +194,26 @@ class QuotaManager:
         is already at its limit; otherwise increments every applicable quota
         and returns (True, None). This closes the check-then-record race where
         two concurrent calls could both pass a limit-of-one quota.
+
+        With a backend the quota holds across workers, and this raises
+        StateBackendError if the backend cannot be reached.
         """
         with self._lock:
+            if self._backend is not None:
+                applicable = self._applicable(tool_name)
+                if not applicable:
+                    return True, None
+                violated = self._backend.counter_reserve(
+                    self._namespace, self._counter_checks(applicable)
+                )
+                if violated is None:
+                    return True, None
+                scope, usage = applicable[violated[0]]
+                return False, (
+                    f"Quota exceeded for '{scope}': "
+                    f"{violated[1]}/{usage.limit.max_calls} "
+                    f"{usage.limit.period.value}"
+                )
             now = time.time()
             for scope in (tool_name, "global"):
                 for usage in self._quotas.get(scope, []):
@@ -177,6 +236,12 @@ class QuotaManager:
     def release(self, tool_name: str) -> None:
         """Roll back a reservation (e.g. dry-run or deduplicated call)."""
         with self._lock:
+            if self._backend is not None:
+                self._backend.counter_release(self._namespace, [
+                    self._counter_key(usage, scope)
+                    for scope, usage in self._applicable(tool_name)
+                ])
+                return
             changed = False
             for scope in (tool_name, "global"):
                 for usage in self._quotas.get(scope, []):
@@ -189,6 +254,12 @@ class QuotaManager:
     def record(self, tool_name: str) -> None:
         """Record a tool execution against all applicable quotas."""
         with self._lock:
+            if self._backend is not None:
+                self._backend.counter_add(
+                    self._namespace,
+                    self._counter_checks(self._applicable(tool_name)),
+                )
+                return
             now = time.time()
             changed = False
             for scope in (tool_name, "global"):
@@ -218,6 +289,14 @@ class QuotaManager:
             return result
 
     def _maybe_reset(self, usage: QuotaUsage, now: float) -> None:
+        if self._backend is not None:
+            # Shared counters are authoritative; refresh the local view.
+            usage.current_calls, usage.window_start = self._backend.counter_get(
+                self._namespace,
+                self._counter_key(usage, usage.limit.scope),
+                float(PERIOD_SECONDS[usage.limit.period]),
+            )
+            return
         window = PERIOD_SECONDS[usage.limit.period]
         if now - usage.window_start >= window:
             usage.current_calls = 0

@@ -225,7 +225,7 @@ def test_chaos_wildcard():
 
 
 def test_chaos_in_shield():
-    chaos = ChaosEngine(seed=1)
+    chaos = ChaosEngine(seed=1, allow_production=True)
     chaos.add_fault("flaky", FaultType.ERROR, probability=1.0, error_message="chaos!")
 
     shield = WarderBox(budget=10.0)

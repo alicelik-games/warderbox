@@ -119,6 +119,31 @@ def _validate_config(config: dict[str, Any]) -> list[str]:
     if "mode" in config and config["mode"] not in ("production", "test"):
         issues.append(f"mode must be 'production' or 'test', got '{config['mode']}'")
 
+    state = config.get("state")
+    if state is not None:
+        if not isinstance(state, dict):
+            issues.append("state must be a mapping")
+        elif state.get("backend") not in ("sqlite", "redis"):
+            issues.append(
+                f"state.backend must be 'sqlite' or 'redis', got {state.get('backend')!r}"
+            )
+        elif state["backend"] == "sqlite" and not state.get("path"):
+            issues.append("state.path is required for the sqlite backend")
+
+    if "namespace" in config and not isinstance(config["namespace"], str):
+        issues.append("namespace must be a string")
+
+    audit_key = config.get("audit_key")
+    if audit_key is not None and not isinstance(audit_key, (str, bytes)):
+        issues.append("audit_key must be a string")
+    audit_key_env = config.get("audit_key_env")
+    if audit_key_env is not None and not isinstance(audit_key_env, str):
+        issues.append("audit_key_env must be a string")
+    if config.get("require_audit_key") is not None and not isinstance(
+        config.get("require_audit_key"), bool
+    ):
+        issues.append("require_audit_key must be a boolean")
+
     valid_risk = {"low", "medium", "high", "critical"}
     for i, rule in enumerate(config.get("rules", [])):
         if not isinstance(rule, dict):

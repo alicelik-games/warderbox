@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 from warderbox import WarderBox
 from warderbox.logger import ActionLogger
+
+SRC = Path(__file__).resolve().parent.parent / "src"
 
 
 def _populate(db_path: str) -> None:
@@ -27,6 +31,7 @@ def test_p1_1_cli_stats_empty_db(tmp_path):
     db = str(tmp_path / "empty.db")
     proc = subprocess.run(
         [sys.executable, "-m", "warderbox", "--db", db, "stats"],
+        env={**os.environ, "PYTHONPATH": str(SRC)},
         capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stderr
@@ -38,6 +43,7 @@ def test_p1_1_cli_stats_populated_db(tmp_path):
     _populate(db)
     proc = subprocess.run(
         [sys.executable, "-m", "warderbox", "--db", db, "stats"],
+        env={**os.environ, "PYTHONPATH": str(SRC)},
         capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stderr
@@ -66,3 +72,23 @@ def test_p1_2_history_loads_from_db(tmp_path):
     assert count == 2
     assert fresh.stats()["total_actions"] == 2
     assert len(fresh.history()) == 2
+
+
+def test_cli_reports_a_wrong_audit_key_cleanly(tmp_path):
+    db = str(tmp_path / "keyed.db")
+    shield = WarderBox(db_path=db, audit_key="right")
+
+    @shield.tool(cost=0.0)
+    def ping(x):
+        return x
+
+    ping(1)
+    env = {**os.environ, "PYTHONPATH": str(SRC), "WARDERBOX_AUDIT_KEY": "wrong"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "warderbox", "--db", db, "stats"],
+        env=env, capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert "does not match" in proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert WarderBox(db_path=db, audit_key="right").verify_audit()

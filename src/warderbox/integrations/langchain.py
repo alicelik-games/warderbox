@@ -28,6 +28,7 @@ from collections.abc import Callable
 from typing import Any
 
 from warderbox.action import Action
+from warderbox.integrations._messages import model_safe_error
 from warderbox.shield import WarderBox, _canonicalize_args
 
 
@@ -88,14 +89,13 @@ class ShieldedTool:
             args=_canonicalize_args(_signature(self.func), call_args, call_kwargs),
             cost=self.cost,
         )
-        result = self.shield._execute(
+        result = self.shield.execute(
             action, self.func, call_args, call_kwargs, self.cost, None
         )
 
-        if result.blocked:
-            return f"[BLOCKED] {result.block_reason}"
-        if result.error:
-            return f"[ERROR] {result.error}"
+        message = model_safe_error(result, self.shield)
+        if message is not None:
+            return message
         return str(result.output)
 
     # LangChain compatibility

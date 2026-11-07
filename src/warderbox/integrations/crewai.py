@@ -29,6 +29,7 @@ from collections.abc import Callable
 from typing import Any
 
 from warderbox.action import Action
+from warderbox.integrations._messages import model_safe_error
 from warderbox.shield import WarderBox, _canonicalize_args
 
 
@@ -72,7 +73,7 @@ class ShieldedCrewTool:
             cost=self._cost,
         )
 
-        result = self.shield._execute(
+        result = self.shield.execute(
             action=action,
             func=self._func,
             args=args,
@@ -81,10 +82,9 @@ class ShieldedCrewTool:
             risk_override=None,
         )
 
-        if result.blocked:
-            return f"[BLOCKED] {result.block_reason}"
-        if result.error:
-            return f"[ERROR] {result.error}"
+        message = model_safe_error(result, self.shield)
+        if message is not None:
+            return message
         return str(result.output) if result.output is not None else ""
 
     def _run(self, *args: Any, **kwargs: Any) -> str:

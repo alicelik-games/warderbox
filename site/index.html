@@ -123,8 +123,8 @@ footer { text-align: center; padding: 40px 24px; border-top: 1px solid var(--bor
 </section>
 
 <section class="stats-bar">
-  <div class="stat"><div class="num">42</div><div class="label">Modules</div></div>
-  <div class="stat"><div class="num">493</div><div class="label">Tests</div></div>
+  <div class="stat"><div class="num">45</div><div class="label">Modules</div></div>
+  <div class="stat"><div class="num">1013</div><div class="label">Tests</div></div>
   <div class="stat"><div class="num">5</div><div class="label">Frameworks</div></div>
   <div class="stat"><div class="num">0</div><div class="label">Dependencies</div></div>
 </section>
@@ -150,7 +150,7 @@ footer { text-align: center; padding: 40px 24px; border-top: 1px solid var(--bor
       <div class="feature-card">
         <div class="icon">&#x23ea;</div>
         <h3>Instant Rollback</h3>
-        <p>Deep-copy state snapshots let you undo any action with a single call. Auto-snapshots any tool you give capture/restore functions.</p>
+        <p>Deep-copy state snapshots restore captured state for tools that provide capture/restore functions. One call undoes the latest unrestored snapshot.</p>
       </div>
       <div class="feature-card">
         <div class="icon">&#x26a1;</div>
@@ -185,7 +185,7 @@ footer { text-align: center; padding: 40px 24px; border-top: 1px solid var(--bor
       <div class="feature-card">
         <div class="icon">&#x1f4dc;</div>
         <h3>Compliance Reports</h3>
-        <p>Audit reports from SQLite logs (inputs for SOC2/GDPR processes). Anomaly detection, risk breakdown, JSON/HTML export.</p>
+        <p>Audit reports from SQLite logs, usable as evidence in SOC 2 or GDPR processes (not a certification). Anomaly detection, risk breakdown, JSON/HTML export.</p>
       </div>
       <div class="feature-card">
         <div class="icon">&#x1f6a6;</div>
@@ -215,7 +215,7 @@ footer { text-align: center; padding: 40px 24px; border-top: 1px solid var(--bor
       <div class="feature-card">
         <div class="icon">&#x23f1;</div>
         <h3>Execution Timeout</h3>
-        <p>Hard deadline enforcement for tool calls. Per-tool timeout overrides. Stops waiting on hanging calls before they burn budget silently.</p>
+        <p>Deadlines for tool calls with per-tool overrides. Thread mode stops waiting while the call may keep running; process mode terminates the worker at the deadline.</p>
       </div>
       <div class="feature-card">
         <div class="icon">&#x1f512;</div>

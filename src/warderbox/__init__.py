@@ -4,6 +4,7 @@ from warderbox.action import Action, ActionResult, RiskLevel
 from warderbox.anomaly import AnomalyAlert, AnomalyDetector, AnomalyType
 from warderbox.approval import ApprovalManager
 from warderbox.async_shield import AsyncWarderBox
+from warderbox.budget import cost_from_usage
 from warderbox.capabilities import CapabilityManager
 from warderbox.chaos import ChaosEngine, FaultType
 from warderbox.circuitbreaker import CircuitBreaker, CircuitState
@@ -12,6 +13,7 @@ from warderbox.config import rules_from_config
 from warderbox.estimator import CostEstimator, Estimate
 from warderbox.fallback import FallbackManager, FallbackRoute
 from warderbox.forecast import CostForecaster
+from warderbox.guards import Block, CallContext, Guard
 from warderbox.idempotency import (
     DedupeResult,
     IdempotencyBackend,
@@ -19,7 +21,7 @@ from warderbox.idempotency import (
     MemoryBackend,
     RedisBackend,
 )
-from warderbox.logger import ActionLogger
+from warderbox.logger import ActionLogger, AuditKeyError
 from warderbox.masking import DataMasker
 from warderbox.multiagent import AgentPool
 from warderbox.output_validation import OutputAction, OutputRule, OutputValidator
@@ -31,6 +33,12 @@ from warderbox.retry import RetryPolicy
 from warderbox.routing import Complexity, ComplexityClassifier, ModelRouter
 from warderbox.scoring import AgentScorer, PoolScorer
 from warderbox.shield import Mode, WarderBox
+from warderbox.state import (
+    RedisStateBackend,
+    SQLiteStateBackend,
+    StateBackend,
+    StateBackendError,
+)
 from warderbox.timeout import TimeoutExecutor, TimeoutPolicy
 from warderbox.tracing import Tracer
 from warderbox.webhooks import EventNotifier
@@ -47,6 +55,9 @@ __all__ = [
     "AnomalyType",
     "ApprovalManager",
     "AsyncWarderBox",
+    "AuditKeyError",
+    "Block",
+    "CallContext",
     "CapabilityManager",
     "ChaosEngine",
     "CircuitBreaker",
@@ -63,6 +74,7 @@ __all__ = [
     "FallbackManager",
     "FallbackRoute",
     "FaultType",
+    "Guard",
     "IdempotencyBackend",
     "IdempotencyGuard",
     "MemoryBackend",
@@ -77,15 +89,20 @@ __all__ = [
     "QuotaPeriod",
     "RateLimiter",
     "RedisBackend",
+    "RedisStateBackend",
     "RetryPolicy",
     "RiskLevel",
+    "SQLiteStateBackend",
+    "StateBackend",
+    "StateBackendError",
     "TimeoutExecutor",
     "TimeoutPolicy",
     "ToolLimit",
     "Tracer",
     "WarderBox",
+    "cost_from_usage",
     "load_policy",
     "rules_from_config",
     "validate_policy",
 ]
-__version__ = "0.3.6"
+__version__ = "0.3.7"

@@ -163,7 +163,7 @@ class ActionReplayer:
             call_args, call_kwargs = (), args
 
         action = Action(tool_name=tool_name, args=args, cost=row.get("cost", 0))
-        result = shield._execute(
+        result = shield.execute(
             action=action,
             func=executor,
             args=call_args,

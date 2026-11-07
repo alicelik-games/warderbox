@@ -152,6 +152,36 @@ class AnomalyDetector:
 
         return new_alerts
 
+    def reconcile(self, tool_name: str, recorded: float, actual: float) -> list[AnomalyAlert]:
+        """Replace a recorded cost with the real charge and re-check spikes.
+
+        A declared cost may hide a spike that only the provider's bill reveals.
+        """
+        with self._lock:
+            for rec in reversed(self._records):
+                if rec.tool_name == tool_name and rec.cost == recorded:
+                    rec.cost = actual
+                    break
+            costs = self._tool_costs.get(tool_name, [])
+            for i in range(len(costs) - 1, -1, -1):
+                if costs[i] == recorded:
+                    costs[i] = actual
+                    break
+            new_alerts = [
+                alert for alert in (
+                    self._check_cost_spike(actual),
+                    self._check_tool_cost_spike(tool_name, actual),
+                ) if alert
+            ]
+            for a in new_alerts:
+                self._alerts.append(a)
+                if self._on_alert:
+                    try:
+                        self._on_alert(a)
+                    except Exception:
+                        pass
+            return new_alerts
+
     def check(self) -> list[AnomalyAlert]:
       with self._lock:
         if not self._records:

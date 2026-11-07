@@ -5,8 +5,10 @@ from __future__ import annotations
 import functools
 import inspect
 import json
+import os
 import threading
 import time
+import warnings
 from collections import deque
 from collections.abc import Callable
 from enum import Enum
@@ -16,12 +18,13 @@ from warderbox.action import Action, ActionResult, RiskLevel
 from warderbox.approval import ApprovalManager
 from warderbox.budget import BudgetTracker
 from warderbox.capabilities import CapabilityManager
-from warderbox.chaos import ChaosEngine
+from warderbox.chaos import ChaosEngine, FaultType
 from warderbox.circuitbreaker import CircuitBreaker
 from warderbox.config import parse_config
 from warderbox.estimator import CostEstimator
 from warderbox.fallback import FallbackManager
-from warderbox.idempotency import DedupeResult, IdempotencyGuard
+from warderbox.guards import Block, CallContext, Guard, default_guards
+from warderbox.idempotency import IdempotencyGuard
 from warderbox.logger import ActionLogger
 from warderbox.masking import DataMasker
 from warderbox.output_validation import OutputValidator
@@ -30,8 +33,9 @@ from warderbox.ratelimit import RateLimiter, ToolLimit
 from warderbox.retry import RetryPolicy, execute_with_retry
 from warderbox.rules import RuleEngine
 from warderbox.snapshot import SnapshotStore
+from warderbox.state import StateBackend, StateBackendError, backend_from_config
+from warderbox.timeout import InFlight, TimeoutExecutor
 from warderbox.timeout import TimeoutError as ToolTimeoutError
-from warderbox.timeout import TimeoutExecutor
 from warderbox.tracing import Tracer
 from warderbox.webhooks import EventNotifier
 
@@ -43,19 +47,11 @@ class Mode(Enum):
 
 OnBlockCallback = Callable[[Action, list[str]], bool]
 
-_RISK_ORDER = {
-    RiskLevel.LOW: 0,
-    RiskLevel.MEDIUM: 1,
-    RiskLevel.HIGH: 2,
-    RiskLevel.CRITICAL: 3,
-}
-
-
 def _resolve_maybe_async(value: Any, timeout: float | None = None) -> Any:
     """Run an awaitable to completion when no event loop is running.
 
     Fallback functions may be async; when a fallback is executed from a
-    worker thread (the async pipeline runs _preflight via asyncio.to_thread)
+    worker thread (the async pipeline runs the guards via asyncio.to_thread)
     there is no running loop, so we can drive the coroutine here. An optional
     timeout bounds the coroutine so an async fallback cannot hang forever.
     """
@@ -102,6 +98,29 @@ def _canonicalize_args(
     return merged
 
 
+def _config_audit_key(config: dict[str, Any]) -> str | None:
+    """The key named by a policy. A named variable that is not set is an error,
+    not a silent fall back to an unkeyed log."""
+    if config.get("audit_key") is not None:
+        return config["audit_key"]
+    name = config.get("audit_key_env")
+    if not name:
+        return None
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(
+            f"audit_key_env: environment variable {name!r} is not set or empty"
+        )
+    return value
+
+
+def _config_flag(config: dict[str, Any], name: str) -> bool:
+    value = config.get(name, False)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false, got {value!r}")
+    return value
+
+
 class WarderBox:
     """Wrap agent tools with rollback, cost control, and testing.
 
@@ -133,27 +152,58 @@ class WarderBox:
         agent_name: str = "",
         max_history: int = 10000,
         allow_private_webhooks: bool = False,
+        state_backend: StateBackend | None = None,
+        namespace: str = "default",
+        audit_key: str | bytes | None = None,
+        require_audit_key: bool = False,
     ) -> None:
+        # Keyless audit logs remain the backwards-compatible default. Opt in
+        # to the stronger mode explicitly: require_audit_key=True raises if no
+        # HMAC key is supplied. This avoids breaking existing
+        # WarderBox(db_path=...) deployments on upgrade.
+        if require_audit_key and not (audit_key or os.environ.get("WARDERBOX_AUDIT_KEY")):
+            raise ValueError(
+                "require_audit_key=True: pass audit_key= or set "
+                "WARDERBOX_AUDIT_KEY (or opt out with require_audit_key=False)."
+            )
         self._mode = Mode(mode)
         self._agent_name = agent_name
         self._auto_snapshot = auto_snapshot
         self._on_block = on_block
         self._rules = RuleEngine()
-        self._budget = BudgetTracker(budget=budget)
+        self._state_backend = state_backend
+        self._namespace = namespace
+        self._budget = BudgetTracker(
+            budget=budget, backend=state_backend, namespace=namespace,
+        )
+        self._budget.on_backend_error = self._backend_error
+        self._guards: list[Guard] = default_guards()
+        self._audit_log_errors = 0
         self._snapshots = SnapshotStore(max_snapshots=max_snapshots)
         self._max_history = max_history
         self._history: deque[ActionResult] = deque(maxlen=max_history)
         self._history_lock = threading.Lock()
         self._tool_states: dict[str, Any] = {}
         self._tool_reversibility: dict[str, bool | None] = {}
-        self._logger = ActionLogger(db_path, masker=None) if db_path else None
+        self._tool_actual_costs: dict[str, Callable[[Any], float]] = {}
+        # Audit logs and webhooks are masked by default. Call
+        # set_masker(DataMasker(enabled=False)) to opt out explicitly.
+        self._masker = DataMasker()
+        self._logger = (
+            ActionLogger(db_path, masker=self._masker, audit_key=audit_key)
+            if db_path else None
+        )
         self._rate_limiter = RateLimiter(
             global_rpm=global_rpm,
             global_rph=global_rph,
             tool_limits=tool_limits or {},
+            backend=state_backend,
+            namespace=namespace,
         )
-        self._notifier = EventNotifier(allow_private_hosts=allow_private_webhooks)
-        self._masker: DataMasker | None = None
+        self._notifier = EventNotifier(
+            masker=self._masker,
+            allow_private_hosts=allow_private_webhooks,
+        )
         self._circuit_breaker: CircuitBreaker | None = None
         self._capabilities: CapabilityManager | None = None
         self._approval: ApprovalManager | None = None
@@ -188,6 +238,12 @@ class WarderBox:
             global_rpm=config.get("global_rpm"),
             global_rph=config.get("global_rph"),
             tool_limits=tool_limits or None,
+            state_backend=(
+                backend_from_config(config["state"]) if config.get("state") else None
+            ),
+            namespace=config.get("namespace", "default"),
+            audit_key=_config_audit_key(config),
+            require_audit_key=_config_flag(config, "require_audit_key"),
         )
         for rule in parsed["extra_rules"]:
             instance._rules.add_rule(rule)
@@ -240,6 +296,14 @@ class WarderBox:
 
     def set_chaos(self, chaos: ChaosEngine) -> None:
         self._chaos = chaos
+        if not self.is_test_mode and chaos.enabled and chaos.allow_production:
+            warnings.warn(
+                "ChaosEngine attached in production mode: its faults will hit "
+                "real tool calls. Use ChaosEngine(allow_production=False) to "
+                "keep it inert outside test mode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def set_timeout(self, timeout: TimeoutExecutor) -> None:
         self._timeout = timeout
@@ -254,7 +318,21 @@ class WarderBox:
         self._fallback = fallback
 
     def set_quota(self, quota: QuotaManager) -> None:
+        # A shield with shared state shares its quotas too, unless the manager
+        # has its own storage.
+        if (
+            self._state_backend is not None
+            and quota._backend is None
+            and not quota._persist_path
+        ):
+            quota.use_backend(self._state_backend, self._namespace)
         self._quota = quota
+
+    def set_actual_cost(self, tool_name: str, fn: Callable[[Any], float]) -> None:
+        """Report a tool's real charge from its output. For tools registered by
+        a framework adapter, where the ``actual_cost=`` decorator argument is
+        not available. See :func:`warderbox.budget.cost_from_usage`."""
+        self._tool_actual_costs[tool_name] = fn
 
     def set_anomaly_detector(self, detector: Any) -> None:
         """Attach an AnomalyDetector; cost of each executed action is recorded."""
@@ -283,12 +361,15 @@ class WarderBox:
         restore_state: Callable[[Any], None] | None = None,
         retry: RetryPolicy | None = None,
         reversible: bool | None = None,
+        actual_cost: Callable[[Any], float] | None = None,
     ) -> Callable:
         def decorator(func: Callable) -> Callable:
             tool_name = func.__name__
 
+            if actual_cost is not None:
+                self._tool_actual_costs[tool_name] = actual_cost
+
             if inspect.iscoroutinefunction(func):
-                import warnings
                 warnings.warn(
                     f"@shield.tool wraps '{tool_name}' which is an async "
                     f"function; the sync pipeline will not await it. Use "
@@ -359,27 +440,24 @@ class WarderBox:
             pass
 
     def _log(self, result: ActionResult) -> None:
-        """Write to the audit logger, isolating logger failures from the call."""
+        """Write to the audit log. A logging failure must not break the tool
+        call, but it must not pass silently either: an audit gap is reported
+        through the audit_log_error event and stats()."""
         if not self._logger:
             return
         try:
             self._logger.log(result)
-        except Exception:
-            pass
+        except Exception as e:
+            with self._history_lock:
+                self._audit_log_errors += 1
+            self._notifier.emit("audit_log_error", {
+                "tool": result.action.tool_name,
+                "action_id": result.action.id,
+                "error": str(e),
+            })
 
-    def _release_reservations(self, action: Action, reservation: Any) -> None:
-        """Release budget/rate/quota and any in-flight idempotency marker.
-
-        Used to clean up when an error or interruption happens after reserving
-        but before the call is finalized, so reservations never leak.
-        """
-        if reservation is not None:
-            self._budget.release(reservation.reservation_id)
-        self._rate_limiter.release(action.tool_name)
-        if self._quota:
-            self._quota.release(action.tool_name)
-        if self._idempotency and self._idempotency.is_protected(action.tool_name):
-            self._idempotency.fail(action.tool_name, action.args, keep=False)
+    def _backend_error(self, error: Exception) -> None:
+        self._notifier.emit("state_backend_error", {"error": str(error)})
 
     def _consult_on_block(self, action: Action, reasons: list[str]) -> bool:
         """Call the on_block callback defensively. A raising callback is
@@ -390,711 +468,351 @@ class WarderBox:
             return False
 
     def _blocked(
-        self, action: Action, reason: str, event: str | None
+        self, ctx: CallContext, reason: str, event: str | None
     ) -> ActionResult:
-        result = ActionResult(action=action, blocked=True, block_reason=reason)
+        result = self._make_result(ctx, blocked=True, block_reason=reason)
         self._append_history(result)
         self._log(result)
         if event is not None:
-            self._notifier.emit(event, {"tool": action.tool_name, "reason": reason})
+            payload = {"tool": ctx.action.tool_name, "reason": reason}
+            if ctx.is_fallback:
+                payload["fallback"] = ctx.tool
+            self._notifier.emit(event, payload)
         return result
 
-    def _fallback_error_result(
-        self,
-        action: Action,
-        fallback_tool: str,
-        message: str,
-        reservation: Any,
-        protected: bool,
-        snapshot_id: str | None,
-        span: Any,
-        *,
-        executed: bool,
-        release_limits: bool = False,
-        keep_marker: bool = True,
-        cost: float = 0.0,
-    ) -> ActionResult:
-        """Finish a failed fallback without leaking reservations or crashing.
+    # -- Guard pipeline --
 
-        ``executed`` means the fallback body returned (so its cost is real);
-        when it is False the budget reservation is released. Rate/quota are
-        released only when ``release_limits`` is set (pre-execution failures).
-        """
-        if reservation is not None:
-            if executed:
-                try:
-                    self._budget.commit(reservation.reservation_id)
-                except Exception:
-                    self._budget.release(reservation.reservation_id)
-            else:
-                self._budget.release(reservation.reservation_id)
-        if release_limits:
-            self._rate_limiter.release(fallback_tool)
-            if self._quota:
-                self._quota.release(fallback_tool)
-        if protected and self._idempotency:
+    def add_guard(self, guard: Guard, before: str = "budget") -> None:
+        """Add a custom guard ahead of a built-in one (by default, before any
+        budget is reserved). See :mod:`warderbox.guards`."""
+        names = [g.name for g in self._guards]
+        if before not in names:
+            raise ValueError(f"Unknown guard '{before}'. Available: {names}")
+        self._guards.insert(names.index(before), guard)
+
+    def _enter_guards(self, ctx: CallContext) -> ActionResult | None:
+        """Run the guards. None means the tool should run now, with the
+        reservations recorded in ``ctx``. Anything else is the final result."""
+        guard: Guard | None = None
+        try:
+            for guard in self._guards:
+                if ctx.is_fallback and not guard.applies_to_fallback:
+                    continue
+                outcome = guard.check(ctx)
+                if outcome is None:
+                    outcome = guard.reserve(ctx)
+                if outcome is None:
+                    ctx.entered.append(guard)
+                    continue
+                self._unwind(ctx)
+                if isinstance(outcome, Block):
+                    return self._blocked(ctx, outcome.reason, outcome.event)
+                return outcome
+        except Exception as e:
+            self._unwind(ctx)
+            message = f"{guard.failure_label}: {e}"
+            if ctx.is_fallback:
+                ctx.charge = False
+                return self._fallback_guard_failed(ctx, message)
+            # Fail closed: the tool does not run, and the agent gets a result.
+            self._notifier.emit("guard_error", {
+                "tool": ctx.tool, "guard": guard.name, "error": message,
+            })
+            return self._blocked(ctx, message, "action_blocked")
+        except BaseException as e:
+            self._unwind(ctx)
+            if ctx.is_fallback:
+                self._fallback_guard_failed(ctx, f"Fallback interrupted: {e}")
+            raise
+        return None
+
+    def _unwind(self, ctx: CallContext) -> None:
+        """Release everything held, newest first. One failing guard must not
+        stop the others from letting go."""
+        while ctx.entered:
+            guard = ctx.entered.pop()
             try:
-                self._idempotency.fail(
-                    fallback_tool, action.args, keep=keep_marker
-                )
-            except Exception:
-                pass
-        result = ActionResult(
-            action=action,
-            error=message,
-            cost=cost,
-            snapshot_id=snapshot_id,
-            fallback_tool=fallback_tool,
-            reversible=self._tool_reversibility.get(fallback_tool),
-        )
+                guard.release(ctx)
+            except Exception as e:
+                self._notifier.emit("guard_error", {
+                    "tool": ctx.tool, "guard": guard.name, "error": str(e),
+                })
+
+    def _make_result(self, ctx: CallContext, **fields: Any) -> ActionResult:
+        fields.setdefault("snapshot_id", ctx.snapshot_id)
+        if ctx.is_fallback:
+            fields.setdefault("fallback_tool", ctx.tool)
+            fields.setdefault("reversible", self._tool_reversibility.get(ctx.tool))
+        return ActionResult(action=ctx.action, **fields)
+
+    def _fallback_guard_failed(self, ctx: CallContext, message: str) -> ActionResult:
+        result = self._make_result(ctx, error=message)
         self._append_history(result)
         self._log(result)
         self._notifier.emit("action_fallback_failed", {
-            "tool": action.tool_name,
-            "fallback": fallback_tool,
-            "error": message,
+            "tool": ctx.action.tool_name, "fallback": ctx.tool, "error": message,
         })
-        self._end_span(span, "error", {"error.message": message})
         return result
 
-    def _run_fallback(
-        self, action: Action, route: Any, args: tuple, kwargs: dict,
-        risk_override: RiskLevel | None = None,
+    def _deduplicated(self, ctx: CallContext, cached: Any) -> ActionResult:
+        result = ActionResult(
+            action=ctx.action, blocked=True,
+            block_reason="Duplicate call blocked (cached result available)",
+            output=cached,
+            fallback_tool=ctx.tool if ctx.is_fallback else None,
+        )
+        self._append_history(result)
+        self._log(result)
+        self._notifier.emit("action_deduplicated", {"tool": ctx.tool})
+        return result
+
+    def _dry_run(self, ctx: CallContext) -> ActionResult:
+        """Finish a test-mode call. Chaos faults fire here too, so resilience
+        can be exercised without running the tool."""
+        try:
+            corrupt = self._inject_chaos(ctx)
+            output: Any = (
+                f"[TEST MODE] Would route to fallback: {ctx.tool}" if ctx.is_fallback
+                else f"[TEST MODE] Would execute: {ctx.action.description}"
+            )
+            if corrupt:
+                output = ChaosEngine.corrupt(output)
+            result = self._make_result(ctx, output=output, cost=ctx.cost, reversible=None)
+        except ToolTimeoutError as e:
+            result = self._tool_failed(ctx, e, timed_out=True)
+        except Exception as e:
+            result = self._tool_failed(ctx, e)
+        self._append_history(result)
+        self._log(result)
+        return result
+
+    def _run_fallback(self, primary: CallContext, route: Any) -> ActionResult:
+        """Run a fallback route through the same guards as a primary call."""
+        ctx = CallContext(
+            shield=self,
+            action=primary.action,
+            tool=route.fallback_tool,
+            cost=route.fallback_cost,
+            args=primary.args,
+            kwargs=primary.kwargs,
+            risk_override=primary.risk_override,
+            route=route,
+        )
+        early = self._enter_guards(ctx)
+        if early is not None:
+            return early
+        self._fallback.record_fallback(primary.action.tool_name)
+        return self._run_entered(ctx, route.fallback_fn, None)
+
+    # -- Shared by the sync and async execution paths --
+
+    def _chaos_fault(self, ctx: CallContext) -> Any:
+        """The fault to inject, if chaos is allowed to fire in this mode."""
+        chaos = self._chaos
+        if not chaos or not chaos.enabled:
+            return None
+        if not (self.is_test_mode or chaos.allow_production):
+            return None
+        return chaos.should_inject(ctx.tool, ctx.action.args)
+
+    def _inject_chaos(self, ctx: CallContext) -> bool:
+        """Apply a fault. Returns True if the tool's output must be corrupted."""
+        fault = self._chaos_fault(ctx)
+        if fault is None:
+            return False
+        self._chaos.inject(fault, ctx.tool)
+        return fault.fault_type is FaultType.CORRUPT_OUTPUT
+
+    def _begin_execution(self, ctx: CallContext) -> None:
+        attributes = {"tool.name": ctx.tool, "tool.cost": ctx.cost}
+        if ctx.is_fallback:
+            attributes["tool.fallback_for"] = ctx.action.tool_name
+        else:
+            attributes["tool.risk"] = ctx.action.risk.value
+        ctx.span = self._start_span(f"tool.{ctx.tool}", attributes)
+        ctx.t0 = time.time()
+
+    def _tool_failed(
+        self, ctx: CallContext, error: Exception, timed_out: bool = False
     ) -> ActionResult:
-        """Run a fallback route through the same guard gates as a primary call."""
-        fallback_tool = route.fallback_tool
+        """Turn a raised exception into the call's result."""
+        if ctx.is_fallback:
+            # A fallback that raised is not charged; its failure is reported
+            # by _finish_call. Rate and quota stay consumed: it did run.
+            ctx.charge = False
+            return self._make_result(ctx, error=str(error))
+        if self._circuit_breaker:
+            self._circuit_breaker.record_failure(ctx.tool)
+        self._notifier.emit("action_timeout" if timed_out else "action_error", {
+            "tool": ctx.tool, "error": str(error),
+        })
+        return self._make_result(ctx, error=str(error), cost=ctx.cost)
 
-        # Capability: the fallback *tool* must itself be permitted — being
-        # allowed to call the primary does not grant the fallback.
-        if self._capabilities:
-            cap_ok, cap_reason = self._capabilities.check(
-                self._agent_name, fallback_tool, args=action.args,
-                cost=route.fallback_cost,
-            )
-            if not cap_ok:
-                return self._blocked(
-                    action, f"Capability denied (fallback): {cap_reason}",
-                    "action_blocked",
-                )
-
-        detected_risk, reasons = self._rules.evaluate(action)
-        # Honor the per-tool risk floor: an explicit risk= can only raise.
-        if risk_override is not None:
-            detected_risk = max(
-                detected_risk, risk_override, key=lambda r: _RISK_ORDER[r]
-            )
-            if not reasons:
-                reasons = [f"declared risk {risk_override.value}"]
-        if detected_risk == RiskLevel.CRITICAL:
-            return self._blocked(
-                action,
-                f"CRITICAL risk blocked (fallback): {'; '.join(reasons)}",
-                "action_blocked",
-            )
-        action.risk = detected_risk
-
-        # on_block: a HIGH-risk action routed to a fallback must still consult
-        # the user callback, exactly like the primary pipeline.
-        if detected_risk == RiskLevel.HIGH and self._on_block:
-            if not self._consult_on_block(action, reasons):
-                return self._blocked(
-                    action,
-                    f"Blocked by user (fallback): {'; '.join(reasons)}",
-                    "action_blocked",
-                )
-
-        # Approval: request approval for whichever tool actually carries the
-        # policy (primary preferred), so a policy on the fallback tool is not
-        # bypassed by requesting approval for an unpoliced primary.
-        if self._approval:
-            approval_tool = None
-            if self._approval.needs_approval(action.tool_name, detected_risk.value):
-                approval_tool = action.tool_name
-            elif self._approval.needs_approval(fallback_tool, detected_risk.value):
-                approval_tool = fallback_tool
-            if approval_tool is not None:
-                decision = self._approval.request_approval(
-                    approval_tool, args=action.args,
-                    risk_level=detected_risk.value, action_id=action.id,
-                )
-                if not decision.approved:
-                    return self._blocked(
-                        action,
-                        f"Approval {decision.decision.value} (fallback): "
-                        f"{decision.reason or 'not approved'}",
-                        "approval_denied",
-                    )
-
-        if self.is_test_mode:
-            # Dry-run: simulate budget/rate/quota (reserve then release) so a
-            # dry-run still reports a fallback that would exceed a limit, but
-            # never invoke the fallback or consume real state.
-            sim = self._budget.reserve(action.id, fallback_tool, route.fallback_cost)
-            if sim is None:
-                return self._blocked(
-                    action,
-                    f"Fallback budget exceeded (cost: ${route.fallback_cost:.2f})",
-                    None,
-                )
-            rate_ok, rate_reason = self._rate_limiter.reserve(fallback_tool)
-            if not rate_ok:
-                self._budget.release(sim.reservation_id)
-                return self._blocked(action, rate_reason, "rate_limited")
-            if self._quota:
-                q_ok, q_reason = self._quota.reserve(fallback_tool)
-                if not q_ok:
-                    self._budget.release(sim.reservation_id)
-                    self._rate_limiter.release(fallback_tool)
-                    return self._blocked(action, q_reason, "quota_exceeded")
-                self._quota.release(fallback_tool)
-            self._budget.release(sim.reservation_id)
-            self._rate_limiter.release(fallback_tool)
-            result = ActionResult(
-                action=action,
-                output=f"[TEST MODE] Would route to fallback: {fallback_tool}",
-                cost=route.fallback_cost,
-                fallback_tool=fallback_tool,
-            )
-            self._append_history(result)
-            self._log(result)
-            return result
-
-        reservation = self._budget.reserve(
-            action.id, fallback_tool, route.fallback_cost
-        )
-        if reservation is None:
-            return self._blocked(
-                action,
-                f"Fallback budget exceeded (cost: ${route.fallback_cost:.2f}, "
-                f"spent: ${self._budget.spent:.2f}, budget: ${self._budget.budget:.2f})",
-                "budget_exceeded",
-            )
-
-        try:
-            rate_ok, rate_reason = self._rate_limiter.reserve(fallback_tool)
-        except Exception as e:
-            return self._fallback_error_result(
-                action, fallback_tool, f"Rate limiter failed: {e}",
-                reservation, False, None, None,
-                executed=False, release_limits=True, keep_marker=False,
-            )
-        except BaseException:
-            self._budget.release(reservation.reservation_id)
-            raise
-        if not rate_ok:
-            self._budget.release(reservation.reservation_id)
-            return self._blocked(action, rate_reason, "rate_limited")
-
-        if self._quota:
-            try:
-                q_ok, q_reason = self._quota.reserve(fallback_tool)
-            except Exception as e:
-                return self._fallback_error_result(
-                    action, fallback_tool, f"Quota reservation failed: {e}",
-                    reservation, False, None, None,
-                    executed=False, release_limits=True, keep_marker=False,
-                )
-            except BaseException:
-                self._budget.release(reservation.reservation_id)
-                self._rate_limiter.release(fallback_tool)
-                raise
-            if not q_ok:
-                self._budget.release(reservation.reservation_id)
-                self._rate_limiter.release(fallback_tool)
-                return self._blocked(action, q_reason, "quota_exceeded")
-
-        # Idempotency: a protected fallback tool must dedupe too.
-        protected = bool(
-            self._idempotency and self._idempotency.is_protected(fallback_tool)
-        )
-        if protected:
-            try:
-                status, cached = self._idempotency.begin(
-                    fallback_tool, action.args
-                )
-            except Exception as e:
-                return self._fallback_error_result(
-                    action, fallback_tool,
-                    f"Idempotency backend failed: {e}",
-                    reservation, True, None, None,
-                    executed=False, release_limits=True, keep_marker=False,
-                )
-            except BaseException as e:
-                self._fallback_error_result(
-                    action, fallback_tool,
-                    f"Fallback interrupted: {e}",
-                    reservation, True, None, None,
-                    executed=False, release_limits=True, keep_marker=False,
-                )
-                raise
-            if status == DedupeResult.DUPLICATE:
-                self._budget.release(reservation.reservation_id)
-                self._rate_limiter.release(fallback_tool)
-                if self._quota:
-                    self._quota.release(fallback_tool)
-                result = ActionResult(
-                    action=action, blocked=True,
-                    block_reason="Duplicate call blocked (cached result available)",
-                    output=cached,
-                    fallback_tool=fallback_tool,
-                )
-                self._append_history(result)
-                self._log(result)
-                self._notifier.emit("action_deduplicated", {"tool": fallback_tool})
-                return result
-
-        # Snapshot the fallback tool's state (if it registered capture/restore)
-        # before execution, so a fallback action can be rolled back too.
-        snapshot_id = None
-        if self._auto_snapshot and fallback_tool in self._tool_states:
-            try:
-                state = self._tool_states[fallback_tool]["capture"]()
-                snap = self._snapshots.capture(
-                    action.id, fallback_tool, state
-                )
-                snapshot_id = snap.id
-            except Exception as e:
-                return self._fallback_error_result(
-                    action, fallback_tool, f"Fallback snapshot failed: {e}",
-                    reservation, protected, None, None,
-                    executed=False, release_limits=True, keep_marker=False,
-                )
-            except BaseException as e:
-                self._fallback_error_result(
-                    action, fallback_tool, f"Fallback interrupted: {e}",
-                    reservation, protected, None, None,
-                    executed=False, release_limits=True, keep_marker=False,
-                )
-                raise
-
-        self._fallback.record_fallback(action.tool_name)
-        fb_span = self._start_span(
-            f"tool.{fallback_tool}",
-            {"tool.name": fallback_tool,
-             "tool.cost": route.fallback_cost,
-             "tool.fallback_for": action.tool_name},
-        )
-        timeout_s = (
-            self._timeout.policy.get_timeout(fallback_tool)
-            if self._timeout else None
-        )
-        fb_t0 = time.time()
-        try:
-            if inspect.iscoroutinefunction(route.fallback_fn):
-                # Async fallback: drive the coroutine with the tool timeout.
-                output = _resolve_maybe_async(
-                    route.fallback_fn(*args, **kwargs), timeout=timeout_s
-                )
-            elif self._timeout:
-                output = self._timeout.execute(
-                    fallback_tool, route.fallback_fn, args, kwargs
-                )
-            else:
-                output = _resolve_maybe_async(route.fallback_fn(*args, **kwargs))
-        except Exception as e:
-            return self._fallback_error_result(
-                action, fallback_tool, str(e),
-                reservation, protected, snapshot_id, fb_span,
-                executed=False, release_limits=False, keep_marker=True,
-            )
-        except BaseException as e:
-            self._fallback_error_result(
-                action, fallback_tool, f"Fallback interrupted: {e}",
-                reservation, protected, snapshot_id, fb_span,
-                executed=False, release_limits=True, keep_marker=True,
-            )
-            raise
-
+    def _validated_result(self, ctx: CallContext, output: Any) -> ActionResult:
+        """Run the output validator (if any) and build the result."""
         if self._output_validator:
             try:
-                check = self._output_validator.validate(fallback_tool, output)
+                check = self._output_validator.validate(ctx.tool, output)
             except Exception as e:
-                # A faulty custom validator must not leak reservations or crash
-                # the caller; the fallback body already ran, so charge its cost.
-                return self._fallback_error_result(
-                    action, fallback_tool, f"Output validation failed: {e}",
-                    reservation, protected, snapshot_id, fb_span,
-                    executed=True, release_limits=False, keep_marker=True,
-                    cost=route.fallback_cost,
-                )
-            except BaseException as e:
-                self._fallback_error_result(
-                    action, fallback_tool, f"Output validation interrupted: {e}",
-                    reservation, protected, snapshot_id, fb_span,
-                    executed=True, release_limits=True, keep_marker=True,
-                    cost=route.fallback_cost,
-                )
-                raise
-            if not check.passed:
-                self._budget.commit(reservation.reservation_id)
-                if protected:
-                    self._idempotency.fail(fallback_tool, action.args)
-                result = ActionResult(
-                    action=action,
-                    error=f"Output blocked: {'; '.join(check.violations)}",
-                    cost=route.fallback_cost,
-                    snapshot_id=snapshot_id,
-                    fallback_tool=fallback_tool,
-                    reversible=self._tool_reversibility.get(fallback_tool),
-                )
-                self._append_history(result)
-                self._log(result)
-                self._notifier.emit("output_blocked", {
-                    "tool": fallback_tool,
-                    "violations": check.violations,
-                })
-                self._end_span(fb_span, "output_blocked", {"output.blocked": True})
-                return result
-            output = check.filtered_output
-
-        result = ActionResult(
-            action=action,
-            output=output,
-            cost=route.fallback_cost,
-            snapshot_id=snapshot_id,
-            fallback_tool=fallback_tool,
-            reversible=self._tool_reversibility.get(fallback_tool),
-        )
-        self._budget.commit(reservation.reservation_id)
-        if protected:
-            try:
-                self._idempotency.complete(fallback_tool, action.args, output)
-            except Exception as e:
-                self._notifier.emit("idempotency_error", {
-                    "tool": fallback_tool, "error": str(e),
-                })
-        self._append_history(result)
-        self._log(result)
-        # First-class recording: the fallback execution feeds the estimator and
-        # anomaly detector under the fallback tool name, like any other call.
-        duration = time.time() - fb_t0
-        try:
-            self._estimator.record(
-                fallback_tool, cost=route.fallback_cost, duration=duration, success=True,
-            )
-        except Exception:
-            pass
-        if self._anomaly is not None:
-            try:
-                for alert in self._anomaly.record(fallback_tool, route.fallback_cost) or []:
-                    self._notifier.emit("anomaly_detected", {
-                        "tool": fallback_tool,
-                        "severity": alert.severity,
-                        "message": alert.message,
+                # A faulty validator must not leak reservations or crash the
+                # caller. The body already ran, so its cost is real.
+                if not ctx.is_fallback:
+                    if self._circuit_breaker:
+                        self._circuit_breaker.record_failure(ctx.tool)
+                    self._notifier.emit("action_error", {
+                        "tool": ctx.tool, "error": str(e),
                     })
-            except Exception:
-                pass
-        if self._budget.warning:
-            self._notifier.emit("budget_warning", {
-                "spent": self._budget.spent, "budget": self._budget.budget,
-            })
-        self._notifier.emit("action_fallback", {
-            "tool": action.tool_name,
-            "fallback": fallback_tool,
-        })
-        self._end_span(fb_span, "ok", {"tool.duration_ms": duration * 1000})
-        return result
-
-    def _preflight(
-        self,
-        action: Action,
-        cost: float,
-        risk_override: RiskLevel | None,
-        args: tuple,
-        kwargs: dict,
-    ) -> tuple[ActionResult | None, Any, str | None]:
-        """Run every pre-execution guard shared by the sync and async paths.
-
-        Returns ``(early_result, reservation, snapshot_id)``. When
-        ``early_result`` is not None the caller must return it unchanged
-        (blocked, deduplicated, fallback, or test-mode result). Otherwise
-        execution should proceed using the returned reservation/snapshot.
-        """
-        if self._capabilities:
-            cap_ok, cap_reason = self._capabilities.check(
-                self._agent_name, action.tool_name,
-                args=action.args, cost=cost,
-            )
-            if not cap_ok:
-                return self._blocked(
-                    action, f"Capability denied: {cap_reason}", "action_blocked",
-                ), None, None
-
-        if self._idempotency:
-            dedup_status, cached = self._idempotency.check(
-                action.tool_name, action.args,
-            )
-            if dedup_status == DedupeResult.DUPLICATE:
-                result = ActionResult(
-                    action=action, blocked=True,
-                    block_reason="Duplicate call blocked (cached result available)",
-                    output=cached,
+                return self._make_result(
+                    ctx, error=f"Output validation failed: {e}", cost=ctx.cost,
+                    output_withheld=True,
                 )
-                self._append_history(result)
-                self._log(result)
-                self._notifier.emit("action_deduplicated", {
-                    "tool": action.tool_name,
+            if not check.passed:
+                self._notifier.emit("output_blocked", {
+                    "tool": ctx.tool, "violations": check.violations,
                 })
-                return result, None, None
-
-        if self._circuit_breaker:
-            cb_ok, cb_reason = self._circuit_breaker.should_allow(action.tool_name)
-            if not cb_ok:
-                if self._fallback and self._fallback.has_fallback(action.tool_name):
-                    route = self._fallback.get_fallback(
-                        action.tool_name, reason="circuit_breaker",
-                    )
-                    if route and route.fallback_fn:
-                        fb_result = self._run_fallback(
-                            action, route, args, kwargs, risk_override
-                        )
-                        if fb_result is not None:
-                            return fb_result, None, None
-
-                return self._blocked(
-                    action, f"Circuit breaker: {cb_reason}", "action_blocked",
-                ), None, None
-
-        detected_risk, reasons = self._rules.evaluate(action)
-        # The per-tool `risk=` acts as a floor, never a ceiling: an explicit
-        # override can only *raise* the risk, so declaring a tool LOW can never
-        # suppress a CRITICAL pattern (e.g. DROP TABLE) detected in its args.
-        if risk_override is not None:
-            action.risk = max(
-                detected_risk, risk_override, key=lambda r: _RISK_ORDER[r]
-            )
-        else:
-            action.risk = detected_risk
-
-        if action.risk == RiskLevel.CRITICAL:
-            return self._blocked(
-                action,
-                f"CRITICAL risk blocked: {'; '.join(reasons)}",
-                "action_blocked",
-            ), None, None
-
-        if action.risk == RiskLevel.HIGH and self._on_block:
-            if not self._consult_on_block(action, reasons):
-                return self._blocked(
-                    action,
-                    f"Blocked by user: {'; '.join(reasons)}",
-                    "action_blocked",
-                ), None, None
-
-        if self._approval and self._approval.needs_approval(
-            action.tool_name, action.risk.value
-        ):
-            decision = self._approval.request_approval(
-                action.tool_name,
-                args=action.args,
-                risk_level=action.risk.value,
-                action_id=action.id,
-            )
-            if not decision.approved:
-                return self._blocked(
-                    action,
-                    f"Approval {decision.decision.value}: "
-                    f"{decision.reason or 'not approved'}",
-                    "approval_denied",
-                ), None, None
-
-        reservation = self._budget.reserve(action.id, action.tool_name, cost)
-        if reservation is None:
-            self._notifier.emit("budget_exceeded", {
-                "tool": action.tool_name, "spent": self._budget.spent,
-                "budget": self._budget.budget,
-            })
-            return self._blocked(
-                action,
-                f"Budget exceeded (spent: ${self._budget.spent:.2f}, "
-                f"budget: ${self._budget.budget:.2f}, action cost: ${cost:.2f})",
-                None,
-            ), None, None
-
-        try:
-            rate_ok, rate_reason = self._rate_limiter.reserve(action.tool_name)
-        except BaseException:
-            self._budget.release(reservation.reservation_id)
-            raise
-        if not rate_ok:
-            self._budget.release(reservation.reservation_id)
-            return self._blocked(action, rate_reason, "rate_limited"), None, None
-
-        if self._quota:
-            try:
-                q_ok, q_reason = self._quota.reserve(action.tool_name)
-            except BaseException:
-                self._budget.release(reservation.reservation_id)
-                self._rate_limiter.release(action.tool_name)
-                raise
-            if not q_ok:
-                self._budget.release(reservation.reservation_id)
-                self._rate_limiter.release(action.tool_name)
-                return self._blocked(action, q_reason, "quota_exceeded"), None, None
-
-        try:
-            return self._preflight_tail(action, cost, reservation)
-        except BaseException:
-            # Snapshot capture / idempotency begin raised (or the thread was
-            # interrupted): release reservations so nothing leaks.
-            self._release_reservations(action, reservation)
-            raise
-
-    def _preflight_tail(
-        self, action: Action, cost: float, reservation: Any
-    ) -> tuple[ActionResult | None, Any, str | None]:
-        snapshot_id = None
-        if self._auto_snapshot and action.tool_name in self._tool_states:
-            state = self._tool_states[action.tool_name]["capture"]()
-            snap = self._snapshots.capture(action.id, action.tool_name, state)
-            snapshot_id = snap.id
-
-        if self.is_test_mode:
-            result = ActionResult(
-                action=action,
-                output=f"[TEST MODE] Would execute: {action.description}",
-                snapshot_id=snapshot_id,
-                cost=cost,
-            )
-            # Dry-run: don't consume real budget/rate/quota state, just
-            # release the reservations so repeated simulations aren't throttled.
-            self._budget.release(reservation.reservation_id)
-            self._rate_limiter.release(action.tool_name)
-            if self._quota:
-                self._quota.release(action.tool_name)
-            self._append_history(result)
-            self._log(result)
-            return result, None, None
-
-        # Atomically reserve the idempotency slot right before execution so
-        # concurrent calls / caller retries cannot double-fire a side effect.
-        if self._idempotency and self._idempotency.is_protected(action.tool_name):
-            status, cached = self._idempotency.begin(action.tool_name, action.args)
-            if status == DedupeResult.DUPLICATE:
-                self._budget.release(reservation.reservation_id)
-                self._rate_limiter.release(action.tool_name)
-                if self._quota:
-                    self._quota.release(action.tool_name)
-                result = ActionResult(
-                    action=action, blocked=True,
-                    block_reason="Duplicate call blocked (cached result available)",
-                    output=cached,
+                ctx.span_status = "output_blocked"
+                return self._make_result(
+                    ctx,
+                    error=f"Output blocked: {'; '.join(check.violations)}",
+                    cost=ctx.cost,
+                    output_withheld=True,
                 )
-                self._append_history(result)
-                self._log(result)
-                self._notifier.emit("action_deduplicated", {"tool": action.tool_name})
-                return result, None, None
+            output = check.filtered_output
+        return self._make_result(
+            ctx, output=output, cost=ctx.cost,
+            reversible=self._tool_reversibility.get(ctx.tool),
+        )
 
-        return None, reservation, snapshot_id
+    def _apply_actual_cost(self, ctx: CallContext, result: ActionResult) -> None:
+        """Let a tool report its real provider charge after execution."""
+        fn = self._tool_actual_costs.get(ctx.tool)
+        if fn is None or result.blocked or result.error is not None:
+            return
+        try:
+            actual = float(fn(result.output))
+        except Exception:
+            return  # no usable report: the declared cost stands
+        if actual >= 0:
+            result.cost = actual
+            result.actual_cost = actual
+            result.cost_source = "actual"
 
-    def _finalize(
-        self,
-        action: Action,
-        result: ActionResult,
-        reservation: Any,
-        snapshot_id: str | None,
-        t0: float,
-        span: Any = None,
-    ) -> ActionResult:
-        """Commit cost, record usage and side-channels after execution.
-
-        Shared by the sync and async execution paths.
-        """
-        self._budget.commit(reservation.reservation_id)
-        # Rate limit and quota were already counted atomically at reservation
-        # time (_preflight), so we don't double-count here.
+    def _finish_call(self, ctx: CallContext, result: ActionResult) -> ActionResult:
+        """Settle reservations and record the call. Used by every path."""
+        self._apply_actual_cost(ctx, result)
+        for guard in reversed(ctx.entered):
+            try:
+                guard.commit(ctx, result)
+            except Exception as e:
+                self._notifier.emit("guard_error", {
+                    "tool": ctx.tool, "guard": guard.name, "error": str(e),
+                })
+        ctx.settled = True
         self._append_history(result)
         self._log(result)
 
-        if self._idempotency and self._idempotency.is_protected(action.tool_name):
-            try:
-                if result.success:
-                    self._idempotency.complete(
-                        action.tool_name, action.args, result.output,
-                    )
-                else:
-                    # Keep the in-flight marker: a protected tool that failed may
-                    # already have produced its side effect, so block retries.
-                    self._idempotency.fail(action.tool_name, action.args)
-            except Exception as e:
-                # A backend failure must not turn a completed tool call into a
-                # caller-visible exception.
-                self._notifier.emit("idempotency_error", {
-                    "tool": action.tool_name, "error": str(e),
+        if ctx.is_fallback:
+            if result.success:
+                self._notifier.emit("action_fallback", {
+                    "tool": ctx.action.tool_name, "fallback": ctx.tool,
                 })
-
-        if result.success:
+            elif ctx.span_status != "output_blocked":
+                self._notifier.emit("action_fallback_failed", {
+                    "tool": ctx.action.tool_name,
+                    "fallback": ctx.tool,
+                    "error": result.error,
+                })
+        elif result.success:
             if self._circuit_breaker:
-                self._circuit_breaker.record_success(action.tool_name)
+                self._circuit_breaker.record_success(ctx.tool)
             self._notifier.emit("action_completed", {
-                "tool": action.tool_name, "cost": result.cost,
+                "tool": ctx.tool, "cost": result.cost,
             })
 
-        if self._budget.warning:
-            self._notifier.emit("budget_warning", {
-                "spent": self._budget.spent, "budget": self._budget.budget,
-            })
+        # The tool already ran: an outage while reading totals must not turn
+        # its result into an exception.
+        try:
+            if self._budget.warning:
+                self._notifier.emit("budget_warning", {
+                    "spent": self._budget.spent, "budget": self._budget.budget,
+                })
+        except StateBackendError as e:
+            self._backend_error(e)
 
-        duration = time.time() - t0
-        # Estimator is a side-channel: a faulty/custom estimator must never
-        # crash the tool call it is measuring.
+        duration = time.time() - ctx.t0
+        # The estimator and anomaly detector are side-channels: a faulty one
+        # must never crash the tool call it is observing.
         try:
             self._estimator.record(
-                action.tool_name,
-                cost=result.cost,
-                duration=duration,
+                ctx.tool, cost=result.cost, duration=duration,
                 success=result.success,
             )
         except Exception:
             pass
         if self._anomaly is not None and result.success:
-            # Anomaly detection is a side-channel: a faulty detector or alert
-            # callback must never crash the tool call it is observing.
             try:
-                alerts = self._anomaly.record(action.tool_name, result.cost)
-                for alert in alerts or []:
-                    self._notifier.emit("anomaly_detected", {
-                        "tool": action.tool_name,
-                        "severity": alert.severity,
-                        "message": alert.message,
-                    })
+                self._emit_anomalies(ctx.tool, self._anomaly.record(ctx.tool, result.cost))
             except Exception:
                 pass
 
-        span_attrs = {
+        attributes: dict[str, Any] = {
             "tool.duration_ms": duration * 1000,
             "tool.blocked": result.blocked,
         }
         if result.error:
-            span_attrs["error.message"] = result.error
-        self._end_span(span, "error" if result.error else "ok", span_attrs)
-
+            attributes["error.message"] = result.error
+        if ctx.span_status:
+            attributes["output.blocked"] = True
+        status = ctx.span_status or ("error" if result.error else "ok")
+        self._end_span(ctx.span, status, attributes)
         return result
 
-    def _apply_output_validation(
-        self, action: Action, output: Any, snapshot_id: str | None, cost: float
+    def _emit_anomalies(self, tool: str, alerts: Any) -> None:
+        for alert in alerts or []:
+            self._notifier.emit("anomaly_detected", {
+                "tool": tool, "severity": alert.severity, "message": alert.message,
+            })
+
+    def _abort_call(self, ctx: CallContext, error: BaseException, message: str) -> None:
+        """Record an interruption and release what the call held. The caller
+        re-raises. Rate, quota and budget go back; an idempotency marker stays
+        if the body may have run."""
+        if ctx.settled:
+            return
+        self._end_span(ctx.span, "error", {"error.message": message})
+        result = self._make_result(ctx, error=message)
+        self._append_history(result)
+        self._log(result)
+        self._unwind(ctx)
+        if ctx.is_fallback:
+            self._notifier.emit("action_fallback_failed", {
+                "tool": ctx.action.tool_name, "fallback": ctx.tool, "error": message,
+            })
+
+    def _interrupted_message(self, ctx: CallContext, error: BaseException) -> str:
+        if ctx.is_fallback:
+            return f"Fallback interrupted: {error}"
+        return f"Interrupted: {type(error).__name__}: {error}"
+
+    # -- Sync execution --
+
+    def execute(
+        self,
+        action: Action,
+        func: Callable,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        cost: float = 0.0,
+        risk_override: RiskLevel | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> ActionResult:
-        """Run the output validator (if any) and build the result."""
-        if self._output_validator:
-            check = self._output_validator.validate(action.tool_name, output)
-            if not check.passed:
-                self._notifier.emit("output_blocked", {
-                    "tool": action.tool_name,
-                    "violations": check.violations,
-                })
-                return ActionResult(
-                    action=action,
-                    error=f"Output blocked: {'; '.join(check.violations)}",
-                    snapshot_id=snapshot_id,
-                    cost=cost,
-                )
-            output = check.filtered_output
-        return ActionResult(
-            action=action,
-            output=output,
-            snapshot_id=snapshot_id,
-            cost=cost,
-            reversible=self._tool_reversibility.get(action.tool_name),
+        """Public execution entry point for framework adapters.
+
+        Integrations should call this instead of the private ``_execute``
+        method. It runs the full safety pipeline and returns an ActionResult.
+        """
+        return self._execute(
+            action, func, args, kwargs or {}, cost, risk_override, retry_policy
         )
 
     def _execute(
@@ -1107,178 +825,147 @@ class WarderBox:
         risk_override: RiskLevel | None,
         retry_policy: RetryPolicy | None = None,
     ) -> ActionResult:
-        early, reservation, snapshot_id = self._preflight(
-            action, cost, risk_override, args, kwargs
+        ctx = CallContext(
+            shield=self, action=action, tool=action.tool_name, cost=cost,
+            args=args, kwargs=kwargs, risk_override=risk_override,
         )
+        early = self._enter_guards(ctx)
         if early is not None:
             return early
+        return self._run_entered(ctx, func, retry_policy)
 
-        try:
-            return self._execute_body(
-                action, func, args, kwargs, cost, retry_policy,
-                reservation, snapshot_id,
+    def _invoke_tool(self, ctx: CallContext, func: Callable) -> Any:
+        if ctx.is_fallback and inspect.iscoroutinefunction(func):
+            # Async fallback: drive the coroutine with the tool's timeout.
+            deadline = (
+                self._timeout.policy.get_timeout(ctx.tool) if self._timeout else None
             )
-        except BaseException:
-            # Interrupted (e.g. KeyboardInterrupt) before finalize: release
-            # budget/rate/quota so nothing leaks. The idempotency marker is
-            # kept (keep=True) because the tool body may already have run.
-            self._budget.release(reservation.reservation_id)
-            self._rate_limiter.release(action.tool_name)
-            if self._quota:
-                self._quota.release(action.tool_name)
-            raise
-
-    def _execute_body(
-        self,
-        action: Action,
-        func: Callable,
-        args: tuple,
-        kwargs: dict,
-        cost: float,
-        retry_policy: RetryPolicy | None,
-        reservation: Any,
-        snapshot_id: str | None,
-    ) -> ActionResult:
-        span = self._start_span(
-            f"tool.{action.tool_name}",
-            {"tool.name": action.tool_name, "tool.cost": cost,
-             "tool.risk": action.risk.value},
-        )
-        t0 = time.time()
-        try:
-            return self._execute_body_impl(
-                action, func, args, kwargs, cost, retry_policy,
-                reservation, snapshot_id, span, t0,
+            return _resolve_maybe_async(func(*ctx.args, **ctx.kwargs), timeout=deadline)
+        if self._timeout:
+            out = self._timeout.execute(
+                ctx.tool, func, ctx.args, ctx.kwargs, inflight=ctx.inflight
             )
-        except BaseException as e:
-            # Record the interruption and close the span before unwinding.
-            # _execute() releases the budget/rate/quota reservations.
-            message = f"Interrupted: {type(e).__name__}: {e}"
-            self._end_span(span, "error", {"error.message": message})
-            result = ActionResult(
-                action=action, error=message, snapshot_id=snapshot_id,
-            )
-            self._append_history(result)
-            self._log(result)
-            raise
-
-    def _execute_body_impl(
-        self,
-        action: Action,
-        func: Callable,
-        args: tuple,
-        kwargs: dict,
-        cost: float,
-        retry_policy: RetryPolicy | None,
-        reservation: Any,
-        snapshot_id: str | None,
-        span: Any,
-        t0: float,
-    ) -> ActionResult:
-        result = None
-        if self._chaos and self._chaos.enabled:
-            fault = self._chaos.should_inject(action.tool_name, action.args)
-            if fault:
+        else:
+            out = func(*ctx.args, **ctx.kwargs)
+        if ctx.is_fallback:
+            out = _resolve_maybe_async(out)
+        if inspect.isawaitable(out):
+            # It will never be awaited here. Fail loudly, don't report success.
+            close = getattr(out, "close", None)
+            if close is not None:
                 try:
-                    self._chaos.inject(fault, action.tool_name)
-                except ToolTimeoutError as e:
-                    if self._circuit_breaker:
-                        self._circuit_breaker.record_failure(action.tool_name)
-                    self._notifier.emit("action_timeout", {
-                        "tool": action.tool_name, "error": str(e),
-                    })
-                    result = ActionResult(
-                        action=action, error=str(e),
-                        snapshot_id=snapshot_id, cost=cost,
-                    )
-                except Exception as e:
-                    if self._circuit_breaker:
-                        self._circuit_breaker.record_failure(action.tool_name)
-                    self._notifier.emit("action_error", {
-                        "tool": action.tool_name, "error": str(e),
-                    })
-                    result = ActionResult(
-                        action=action, error=str(e),
-                        snapshot_id=snapshot_id, cost=cost,
-                    )
+                    close()
+                except Exception:
+                    pass
+            raise TypeError(
+                f"Tool '{ctx.tool}' is async; wrap it with "
+                f"AsyncWarderBox.async_tool, not @shield.tool"
+            )
+        return out
 
-        if result is None:
-            def _invoke() -> Any:
-                if self._timeout:
-                    out = self._timeout.execute(
-                        action.tool_name, func, args, kwargs,
-                    )
-                else:
-                    out = func(*args, **kwargs)
-                if inspect.isawaitable(out):
-                    # A sync tool returned a coroutine: it will never be
-                    # awaited here. Fail loudly instead of reporting success.
-                    try:
-                        out.close()
-                    except Exception:
-                        pass
-                    raise TypeError(
-                        f"Tool '{action.tool_name}' is async; wrap it with "
-                        f"AsyncWarderBox.async_tool, not @shield.tool"
-                    )
-                return out
-
-            # Protected (idempotent-guarded) tools must not auto-retry: a retry
-            # after a side effect already landed is exactly the double-send we
-            # are guarding against.
-            effective_retry = retry_policy
-            if (
-                retry_policy
-                and self._idempotency
-                and self._idempotency.is_protected(action.tool_name)
-            ):
-                effective_retry = None
-
+    def _run_entered(
+        self, ctx: CallContext, func: Callable, retry_policy: RetryPolicy | None
+    ) -> ActionResult:
+        self._begin_execution(ctx)
+        try:
             try:
-                if effective_retry:
+                corrupt = self._inject_chaos(ctx)
+                ctx.started = True
+                # Protected tools must not auto-retry: a retry after a side
+                # effect landed is exactly the double-send being guarded against.
+                if retry_policy and not ctx.protected:
+                    if not retry_policy.overlap_on_timeout:
+                        ctx.inflight = InFlight()
                     output, _errors = execute_with_retry(
-                        _invoke, (), {}, effective_retry
+                        lambda: self._invoke_tool(ctx, func), (), {}, retry_policy
                     )
                 else:
-                    output = _invoke()
-                result = self._apply_output_validation(action, output, snapshot_id, cost)
+                    output = self._invoke_tool(ctx, func)
+                if corrupt:
+                    output = ChaosEngine.corrupt(output)
+                result = self._validated_result(ctx, output)
             except ToolTimeoutError as e:
-                if self._circuit_breaker:
-                    self._circuit_breaker.record_failure(action.tool_name)
-                self._notifier.emit("action_timeout", {
-                    "tool": action.tool_name, "error": str(e),
-                })
-                result = ActionResult(
-                    action=action, error=str(e),
-                    snapshot_id=snapshot_id, cost=cost,
-                )
+                result = self._tool_failed(ctx, e, timed_out=True)
             except Exception as e:
-                if self._circuit_breaker:
-                    self._circuit_breaker.record_failure(action.tool_name)
-                self._notifier.emit("action_error", {
-                    "tool": action.tool_name, "error": str(e),
-                })
-                result = ActionResult(
-                    action=action, error=str(e),
-                    snapshot_id=snapshot_id, cost=cost,
-                )
-
-        return self._finalize(action, result, reservation, snapshot_id, t0, span)
+                result = self._tool_failed(ctx, e)
+            return self._finish_call(ctx, result)
+        except BaseException as e:
+            self._abort_call(ctx, e, self._interrupted_message(ctx, e))
+            raise
 
     # -- Cost Reconciliation --
 
     def reconcile_cost(self, action_id: str, actual_cost: float) -> bool:
-        """Update a recorded action with the actual provider charge."""
+        """Update a recorded action with the actual provider charge.
+
+        Updates the budget, the history, the estimator and the anomaly detector.
+        The audit log is append-only and keeps the cost known at call time; the
+        change is announced through the ``cost_reconciled`` event.
+        """
         entry = self._budget.reconcile(action_id, actual_cost)
-        return entry is not None
+        if entry is None:
+            return False
+        recorded = entry.estimated_cost
+        with self._history_lock:
+            target = next(
+                (r for r in reversed(self._history) if r.action.id == action_id),
+                None,
+            )
+            if target is not None:
+                target.cost = actual_cost
+                target.actual_cost = actual_cost
+                target.cost_source = "reconciled"
+        tool = entry.tool_name
+        try:
+            self._estimator.reconcile(tool, recorded, actual_cost)
+        except Exception:
+            pass
+        if self._anomaly is not None:
+            try:
+                self._emit_anomalies(
+                    tool, self._anomaly.reconcile(tool, recorded, actual_cost)
+                )
+            except Exception:
+                pass
+        self._notifier.emit("cost_reconciled", {
+            "tool": tool, "action_id": action_id,
+            "recorded": recorded, "actual": actual_cost,
+        })
+        return True
+
+    def verify_audit(self, expected_head: dict | None = None) -> bool:
+        """Verify the audit log's hash chain (when a DB logger is configured).
+
+        See :mod:`warderbox.logger` for what this does and does not prove.
+        """
+        if self._logger is None:
+            return True
+        return self._logger.verify_integrity(expected_head)
+
+    def adopt_unkeyed_audit_history(self) -> None:
+        """Accept rows written before an audit key was configured. See
+        :meth:`warderbox.logger.ActionLogger.adopt_unkeyed_history`."""
+        if self._logger is None:
+            raise ValueError("No audit log configured (db_path)")
+        self._logger.adopt_unkeyed_history()
+
+    def audit_head(self) -> dict | None:
+        """The audit chain's position, to store outside the agent's reach."""
+        return self._logger.audit_head() if self._logger else None
 
     # -- Rollback --
 
     def rollback(self, action_id: str | None = None) -> bool:
-        if action_id:
-            snap = self._snapshots.get_by_action(action_id)
-        else:
-            snap = self._snapshots.get_latest()
+        # Walk backwards through unrestored snapshots so repeated rollback
+        # calls undo one action at a time instead of restoring the same
+        # snapshot forever.
+        snap = None
+        for candidate in reversed(self._snapshots.list_all()):
+            if candidate.restored:
+                continue
+            if action_id is None or candidate.action_id == action_id:
+                snap = candidate
+                break
 
         if snap is None:
             return False
@@ -1294,9 +981,23 @@ class WarderBox:
 
     # -- History --
 
-    def history(self) -> list[dict]:
+    def _masked_text(self, text: str | None) -> str | None:
+        if not text or not self._masker:
+            return text
+        try:
+            return self._masker.mask_string(text)
+        except Exception:
+            return "[UNMASKABLE]"
+
+    def history(self, raw: bool = False) -> list[dict]:
+        """Recent calls, with errors and block reasons masked like the audit log.
+
+        ``raw=True`` returns them unmasked, for code in the same process that
+        needs the original text. The dashboard never uses it.
+        """
         with self._history_lock:
             snapshot = list(self._history)
+        text = (lambda value: value) if raw else self._masked_text
         results = []
         for r in snapshot:
             results.append({
@@ -1304,9 +1005,10 @@ class WarderBox:
                 "tool": r.action.tool_name,
                 "risk": r.action.risk.value,
                 "blocked": r.blocked,
-                "block_reason": r.block_reason,
-                "error": r.error,
+                "block_reason": text(r.block_reason),
+                "error": text(r.error),
                 "cost": r.cost,
+                "cost_source": r.cost_source,
                 "success": r.success,
                 "has_snapshot": r.snapshot_id is not None,
                 "reversible": r.reversible,
@@ -1378,10 +1080,13 @@ class WarderBox:
             self._history = deque(rebuilt, maxlen=self._max_history)
         # Rebuild spend so budget / FinOps reflect the persisted history.
         # reset() first makes repeated loads idempotent (no double counting).
-        self._budget.reset()
-        for r in rebuilt:
-            if not r.blocked and r.cost:
-                self._budget.record(r.action.id, r.action.tool_name, r.cost)
+        # Shared totals already include this spend and belong to all workers:
+        # a dashboard loading history must never reset or re-count them.
+        if not self._budget.shared:
+            self._budget.reset()
+            for r in rebuilt:
+                if not r.blocked and r.cost:
+                    self._budget.record(r.action.id, r.action.tool_name, r.cost)
         if close_after:
             logger.close()
         return len(rebuilt)
@@ -1394,12 +1099,16 @@ class WarderBox:
         total = len(snapshot)
         blocked = sum(1 for r in snapshot if r.blocked)
         errors = sum(1 for r in snapshot if r.error)
+        budget = self._budget.summary()
+        rate_limits = self._rate_limiter.stats()
         return {
+            "degraded": bool(budget.get("degraded") or rate_limits.get("degraded")),
             "total_actions": total,
             "blocked": blocked,
             "errors": errors,
             "successful": total - blocked - errors,
             "snapshots": self._snapshots.count,
-            "budget": self._budget.summary(),
-            "rate_limits": self._rate_limiter.stats(),
+            "budget": budget,
+            "rate_limits": rate_limits,
+            "audit_log_errors": self._audit_log_errors,
         }

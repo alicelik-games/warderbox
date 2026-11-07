@@ -182,6 +182,18 @@ class CostEstimator:
             if used_fallback:
                 stats.fallbacks_used += 1
 
+    def reconcile(self, tool_name: str, recorded: float, actual: float) -> None:
+        """Replace a recorded cost so later estimates use the real charge."""
+        with self._lock:
+            stats = self._stats.get(tool_name)
+            if stats is None:
+                return
+            for i in range(len(stats.costs) - 1, -1, -1):
+                if stats.costs[i] == recorded:
+                    stats.costs[i] = actual
+                    stats.total_cost += actual - recorded
+                    return
+
     def estimate(
         self,
         plan: list[str],

@@ -48,6 +48,14 @@ class ActionResult:
     # Set when this result came from a circuit-breaker fallback route. The
     # primary action remains action.tool_name; this records what actually ran.
     fallback_tool: str | None = None
+    # Provider-reported cost after execution, when an actual_cost callback is
+    # supplied. None means the declared cost is still the best estimate.
+    actual_cost: float | None = None
+    # Where `cost` came from: "declared" (the tool's estimate), "actual" (its
+    # actual_cost callback) or "reconciled" (reconcile_cost after the fact).
+    cost_source: str = "declared"
+    # The tool ran but its output failed validation and was not returned.
+    output_withheld: bool = False
 
     @property
     def success(self) -> bool:

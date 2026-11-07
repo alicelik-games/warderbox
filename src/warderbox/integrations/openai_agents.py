@@ -18,6 +18,7 @@ from collections.abc import Callable
 from typing import Any
 
 from warderbox.action import Action, ActionResult
+from warderbox.integrations._messages import model_safe_error
 from warderbox.shield import WarderBox
 
 
@@ -94,7 +95,16 @@ def execute_tool_call(
     cost = registry.get(tool_name, {}).get("cost", 0.0)
 
     action = Action(tool_name=tool_name, args=args, cost=cost)
-    return shield._execute(action, executor, (), args, cost, None)
+    return shield.execute(action, executor, (), args, cost, None)
+
+
+def format_tool_output(result: ActionResult, shield: WarderBox | None = None) -> str:
+    """The string to send back to the model as a tool message. Never includes
+    the detailed block reason; read that from the ActionResult."""
+    message = model_safe_error(result, shield)
+    if message is not None:
+        return message
+    return str(result.output) if result.output is not None else ""
 
 
 class OpenAIShieldMiddleware:
@@ -136,3 +146,7 @@ class OpenAIShieldMiddleware:
             )
 
         return execute_tool_call(self.shield, name, arguments, executor)
+
+    def format_output(self, result: ActionResult) -> str:
+        """The model-safe string to return for a handled tool call."""
+        return format_tool_output(result, self.shield)

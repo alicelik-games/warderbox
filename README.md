@@ -17,7 +17,7 @@
 
 WarderBox intercepts every tool call your AI agent makes and provides rollback, cost control, execution timeout, idempotency guard, output validation, fallback routing, execution quotas, smart model routing, cost anomaly detection, rate limiting, circuit breakers, approval workflows, distributed tracing, chaos testing, and compliance reporting — so agents can work autonomously without causing damage.
 
-**Zero mandatory dependencies. One `pip install`. Works with every major agent framework.**
+**Zero mandatory dependencies. One `pip install`. Works with 5 major agent frameworks — or plain Python.**
 
 > **Market context:** With Guardrails AI acquired by Harvey (Sept 2026) and the AI agent safety market projected to grow from $610M to $6.85B at 41% CAGR, WarderBox fills the gap as a comprehensive, framework-agnostic agent operations platform.
 
@@ -28,7 +28,7 @@ WarderBox intercepts every tool call your AI agent makes and provides rollback, 
 | Agent runs `DROP TABLE` | Auto-blocked by risk classification |
 | Agent overspends API budget | Budget limits + cost forecasting |
 | Want to test without side effects | Test mode simulates everything |
-| Agent made a mistake | One-call rollback via state snapshots |
+| Agent made a mistake | One-call rollback via state snapshots (tools with capture/restore) |
 | Agent spams an API | Rate limiting (RPM/RPH per tool) |
 | Tool keeps failing | Circuit breaker auto-disables it |
 | Need human approval | Approval workflows with timeout/escalation |
@@ -62,6 +62,8 @@ pip install warderbox[langchain]   # LangChain
 pip install warderbox[crewai]      # CrewAI
 pip install warderbox[autogen]     # Microsoft AutoGen
 pip install warderbox[yaml]        # YAML policy files
+pip install warderbox[redis]       # Shared limits across machines
+pip install warderbox[sql]         # SQL parser alongside the built-in detection
 pip install warderbox[all]         # Everything
 ```
 
@@ -158,17 +160,35 @@ def flaky_api(query: str) -> str:
     return requests.get(f"https://api.example.com?q={query}").text
 ```
 
+Timeouts are retried like any other error, and `retry_on` decides for them too.
+When a thread-mode deadline passes the tool is still running, so a retry keeps
+waiting for that same attempt and uses its result instead of running the tool
+twice at once; a new attempt starts only once the first one has failed. For a
+read-only tool that may hang, `RetryPolicy(overlap_on_timeout=True)` starts a new
+attempt alongside it. Process isolation kills the old attempt, and coroutines are
+cancelled, so their retries start fresh.
+
 ### Sensitive Data Masking
 
 ```python
 from warderbox import DataMasker
 
+# Masking is on by default for audit logs and webhooks. Attach a custom
+# masker if you want additional patterns:
 masker = DataMasker()
 shield.set_masker(masker)
-
-# Emails, API keys, credit cards, SSNs, JWTs are auto-masked in logs
 masker.add_pattern("project_id", r"PROJ-\d{6}", "PROJ-******")
+
+# Opt out explicitly if raw logs are required:
+# shield.set_masker(DataMasker(enabled=False))
 ```
+
+Masking covers strings, bytes, tuples, sets, dict keys and objects (through
+`str()`), plus common credential formats: OpenAI, Anthropic, Stripe, GitHub,
+GitLab, Slack, Google, Hugging Face, npm, SendGrid, AWS, PEM private keys and
+passwords in URLs. Everything under a sensitive key (`password`, `api_key`,
+`token`, ...) is redacted however deeply nested. It is pattern based: a secret
+in an unknown format is only caught under a sensitive key.
 
 ## Enterprise Safety
 
@@ -192,7 +212,8 @@ from warderbox import ApprovalManager
 
 approver = ApprovalManager(default_timeout=30.0)
 approver.require_approval("send_email", timeout=60.0)
-approver.require_approval_for_risk("HIGH")
+approver.require_approval_for_risk("HIGH")  # applies to HIGH and CRITICAL
+# auto_deny=False surfaces a timeout as ESCALATED (manual review), not a silent deny
 shield.set_approval(approver)
 
 # From another thread or webhook handler:
@@ -230,6 +251,55 @@ reporter.export_json("audit.json")
 html = reporter.to_html()      # Full HTML report
 ```
 
+Reports are evidence you can use in SOC 2, GDPR or internal audit work.
+Generating them does not make a system compliant or certified.
+
+### Audit Log Integrity
+
+Every action is written to a hash chain. What verification proves depends on
+how you run it:
+
+| Mode | Detects | Does not detect |
+|------|---------|-----------------|
+| No key | Edited, reordered, removed or truncated rows | Anyone with write access recomputing the whole chain |
+| `audit_key=` or `WARDERBOX_AUDIT_KEY` | Also: forged entries and a rewritten chain | Restoring an old copy of the file; deleting the whole file |
+| Key + external anchor | Also: rollback or deletion past the anchor | Entries written after the last anchor, if the file is rolled back to it |
+
+
+Keyless logs stay the backwards-compatible default. For production, opt in to
+the stronger mode with `require_audit_key=True` (or `require_audit_key: true` in
+a policy); then `WarderBox` refuses to start without `audit_key=` or
+`WARDERBOX_AUDIT_KEY`.
+
+In a policy file, name the environment variable that holds the key rather than
+writing the key itself: whoever can read the file could otherwise sign entries.
+A named variable that is not set stops startup instead of falling back to an
+unkeyed log.
+
+```yaml
+db_path: audit.db
+audit_key_env: WARDERBOX_AUDIT_KEY
+require_audit_key: true
+```
+
+Opening a keyed log with a different key raises `AuditKeyError` before anything
+is written, so a mistyped key cannot damage the log. Without a key a keyed log
+can be read (the CLI dashboard does this) but not written to.
+
+```python
+shield = WarderBox(budget=5.0, db_path="audit.db", audit_key=os.environ["AUDIT_KEY"])
+
+anchor = shield.audit_head()      # store this where the agent cannot write
+shield.verify_audit()             # chain + state
+shield.verify_audit(anchor)       # also proves nothing before the anchor was lost
+```
+
+Moving an existing database to a key is explicit: call
+`shield.adopt_unkeyed_audit_history()` once, after checking the log. Until
+then verification fails, so a forged unkeyed log cannot be adopted silently.
+If logging itself fails, the tool call still returns, the `audit_log_error`
+event fires and `stats()["audit_log_errors"]` goes up.
+
 ## Observability
 
 ### Distributed Tracing
@@ -265,6 +335,14 @@ print(report.burn_rate_per_hour)       # $/hour
 print(report.estimated_exhaustion)     # datetime
 print(report.estimated_actions_remaining)
 print(report.trend)                    # "increasing" / "stable" / "decreasing"
+
+# For provider-reported charges, reconcile the declared estimate:
+@shield.tool(cost=0.03, actual_cost=lambda output: 0.017)
+def llm_call(prompt: str):
+    ...
+
+# or after the fact:
+shield.reconcile_cost(action_id, actual_cost=0.017)
 ```
 
 ### Agent Scoring & Benchmarking
@@ -346,6 +424,17 @@ shield.notifier.add_webhook(
 shield.notifier.on("action_blocked", lambda event, data: print(f"Alert: {data}"))
 ```
 
+Delivery resolves the hostname on every attempt, requires every address to be
+public and connects to those exact addresses, so a DNS answer cannot change
+between the check and the connection. Redirects are not followed.
+
+`HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` are honored with the same checks: the
+proxy is asked for the validated address, and only if it refuses that (a proxy
+with a hostname allowlist) for the hostname. Where the local network has no
+external DNS, the proxy is asked by hostname and does the resolving itself, so
+that one case relies on the proxy to keep internal hosts out of reach.
+`allow_private_webhooks=True` allows private targets.
+
 ## Resilience Testing
 
 ### Chaos Engineering
@@ -355,7 +444,10 @@ Test agent resilience with controlled fault injection:
 ```python
 from warderbox import ChaosEngine, FaultType
 
-chaos = ChaosEngine()
+# Faults fire wherever the engine is attached: against real calls in production
+# mode (with a RuntimeWarning when attached), and in test mode without running the
+# Inert in production by default; opt in explicitly for a drill.
+chaos = ChaosEngine(allow_production=True)
 shield.set_chaos(chaos)
 
 # Random failures (20% of calls)
@@ -370,6 +462,8 @@ chaos.add_fault("db_query", FaultType.ERROR,
 
 # Wildcard — affect all tools
 chaos.add_fault("*", FaultType.LATENCY, latency_ms=500, probability=0.1)
+
+# Also available: FaultType.TIMEOUT and FaultType.CORRUPT_OUTPUT
 ```
 
 ### Action Replay
@@ -396,7 +490,23 @@ shield.set_timeout(TimeoutExecutor(TimeoutPolicy(
 @shield.tool(cost=0.05)
 def slow_api(query: str) -> str:
     return external_api.call(query)  # times out after 60s
+
+# By default a timeout stops waiting but the tool KEEPS RUNNING in its thread,
+# and its side effect may still land. Automatic retries are disabled after a
+# timeout so that side effect cannot be duplicated.
 ```
+
+To actually stop the work, use process isolation for everything or per tool:
+
+```python
+TimeoutPolicy(default_seconds=30, isolation="process")
+TimeoutPolicy(default_seconds=30, process_tools={"run_migration"})
+```
+
+The tool then runs in a forked child that is terminated at the deadline. That
+requires `fork` (not Windows) and a picklable return value. In-memory changes
+the tool makes stay in the child, and anything it already sent to an external
+system cannot be recalled.
 
 ### Idempotency Guard
 
@@ -518,36 +628,122 @@ warderbox dashboard --port 8080    # Start web dashboard
 | HIGH | Ask for approval *(when an ApprovalManager or on_block callback is configured)* | Bulk operations (>100 items) |
 | CRITICAL | Auto-block | DROP TABLE, TRUNCATE, DELETE FROM |
 
+SQL detection reads comments, quoting and multiple statements the way databases
+do, and with `warderbox[sql]` adds a real parser. It looks for statements in any
+argument, so it cannot tell every free-text field from SQL: outside SQL fields
+only text that reads as a statement counts. It is a safety net against agent mistakes, not a
+security boundary. Give the agent's database user only the permissions it needs.
+
 ## Architecture
 
 ```
 Agent -> WarderBox -> Tool
-         |-- Idempotency Check (block duplicates)
          |-- Capability Check (permissions)
+         |-- Idempotency Check (block duplicates)
          |-- Circuit Breaker + Fallback Routing
          |-- Risk Classification (rules engine)
          |-- Approval Workflow (human-in-the-loop)
-         |-- Budget Reserve (thread-safe)
-         |-- Rate Limit Check
-         |-- Quota Check (daily/weekly/monthly)
+         |-- Your custom guards
+         |-- Budget Reserve
+         |-- Rate Limit Reserve
+         |-- Quota Reserve (daily/weekly/monthly)
+         |-- Idempotency Slot
          |-- Snapshot (for rollback)
-         |-- Chaos Injection (testing)
-         |-- Execute with Timeout (or simulate)
+         |-- Test Mode (simulate and stop here)
+         |-- Chaos Injection (test mode, or with opt-in)
+         |-- Execute with Timeout and Retry
          |-- Output Validation (redact/block)
-         |-- Retry (on failure, with backoff)
+         |-- Actual Cost, Settle Reservations
          |-- Data Masking (for logs)
-         |-- Log to SQLite
+         |-- Log to SQLite (hash chain)
          |-- Emit webhook/callback events
          |-- Record span (distributed tracing)
-         |-- Agent Scoring
-         |-- Smart Model Routing (FinOps)
          |-- Cost Anomaly Detection
-         |-- Prometheus metrics
 ```
+
+A fallback goes through these same guards, so a gate cannot exist on one path
+and be missing on the other. Each guard that reserved something releases it, in
+reverse order, if a later guard stops the call or the call is interrupted.
+
+### Custom Guards
+
+```python
+from warderbox import Block, Guard
+
+class BusinessHours(Guard):
+    name = "business_hours"
+
+    def check(self, ctx):
+        if not is_business_hours():
+            return Block(f"{ctx.tool} is only allowed in business hours")
+
+shield.add_guard(BusinessHours())  # runs before budget is reserved
+```
+
+Override `check`, `reserve`, `release` and `commit` as needed. A guard that
+raises stops the call rather than letting it through.
+
+### Shared limits across workers
+
+By default budget, rate-limit and quota counters live in process memory: four
+gunicorn workers with a $5 budget can spend $20. Give them a backend to share:
+
+```python
+from warderbox import RedisStateBackend, SQLiteStateBackend, WarderBox
+
+# Workers on one machine, no dependencies
+backend = SQLiteStateBackend("warderbox-state.db")
+# Workers across machines: pip install warderbox[redis]
+backend = RedisStateBackend("redis://localhost:6379/0")
+
+shield = WarderBox(budget=5.0, state_backend=backend, namespace="prod")
+shield.set_quota(quota)  # shares the same backend
+```
+
+Or in a policy file: `{"namespace": "prod", "state": {"backend": "sqlite", "path": "state.db"}}`.
+
+- Each check-and-reserve is atomic across workers.
+- A crashed worker's budget reservation returns after its time-to-live (1 hour
+  by default, `BudgetTracker(reservation_ttl=)`). Make it longer than your
+  slowest tool.
+- If the backend is unreachable new calls are **blocked**, not run unmetered,
+  and `state_backend_error` fires. A charge that could not be written is kept
+  and retried, and shows in `budget_summary["pending_charges"]`.
+- Cost entries, circuit breakers, the estimator and anomaly detection remain per
+  process. Idempotency has its own `RedisBackend`.
+
+### Real cost vs declared cost
+
+`cost=` is your estimate. Unless a tool reports its real charge, budgets and
+forecasts are projecting that estimate:
+
+```python
+from warderbox import cost_from_usage
+
+@shield.tool(cost=0.05, actual_cost=cost_from_usage(3.0, 15.0))  # $ per MTok
+def call_model(prompt):
+    return client.messages.create(...)  # output has a .usage report
+
+shield.set_actual_cost("search", lambda out: out["billed"])  # for adapter tools
+shield.reconcile_cost(action_id, 0.42)                       # after the invoice
+```
+
+Results and `history()` carry `cost_source` (`declared`, `actual` or
+`reconciled`), and forecasts report `actual_cost_share`. `reconcile_cost` updates
+the budget, history, estimator and anomaly detector. The audit log is append-only
+and keeps the cost known at call time; the `cost_reconciled` event records the
+change.
+
+### Rollback scope
+
+`rollback()` restores state captured by the tool's `snapshot_state` /
+`restore_state` callbacks. It cannot undo an email already sent, a payment
+captured, or a remote API write unless the tool provides a compensating
+restore function.
 
 ## Stats
 
-- **42 Python modules**, 493 tests
+- **45 Python modules**, 1013 tests
 - **Zero mandatory dependencies**
 - **5 framework integrations**
 - Works with Python 3.11+

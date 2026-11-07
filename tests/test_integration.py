@@ -57,7 +57,7 @@ def _full_shield(budget=10.0, db_path=None):
 
 def _full_shield_with_chaos(budget=10.0):
     shield = _full_shield(budget=budget)
-    chaos = ChaosEngine()
+    chaos = ChaosEngine(allow_production=True)
     shield.set_chaos(chaos)
     return shield, chaos
 
@@ -1661,7 +1661,7 @@ def test_99_end_to_end_scenario():
 def test_100_version_and_exports():
     """Verify all public exports are accessible."""
     import warderbox
-    assert warderbox.__version__ == "0.3.6"
+    assert warderbox.__version__ == "0.3.7"
 
     required = [
         "WarderBox", "AsyncWarderBox", "AgentPool", "AgentScorer",

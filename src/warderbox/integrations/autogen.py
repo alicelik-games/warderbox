@@ -33,6 +33,7 @@ from collections.abc import Callable
 from typing import Any
 
 from warderbox.action import Action
+from warderbox.integrations._messages import model_safe_error
 from warderbox.shield import WarderBox
 
 
@@ -71,7 +72,7 @@ def _wrap_function(
             cost=cost,
         )
 
-        result = shield._execute(
+        result = shield.execute(
             action=action,
             func=func,
             args=args,
@@ -80,10 +81,9 @@ def _wrap_function(
             risk_override=None,
         )
 
-        if result.blocked:
-            return f"[BLOCKED by WarderBox] {result.block_reason}"
-        if result.error:
-            return f"[ERROR] {result.error}"
+        message = model_safe_error(result, shield)
+        if message is not None:
+            return message
         return str(result.output) if result.output is not None else ""
 
     return wrapper

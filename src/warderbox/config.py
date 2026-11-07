@@ -23,7 +23,7 @@ import re
 from typing import Any
 
 from warderbox.action import Action, RiskLevel
-from warderbox.rules import Rule
+from warderbox.rules import Rule, _iter_strings
 
 
 def _make_checker(match: dict[str, Any]):
@@ -43,15 +43,15 @@ def _make_checker(match: dict[str, Any]):
             return False
         if args_contain:
             found = any(
-                isinstance(v, str) and args_contain.lower() in v.lower()
-                for v in action.args.values()
+                args_contain.lower() in s.lower()
+                for s in _iter_strings(action.args)
             )
             if not found:
                 return False
         if compiled_regex:
             found = any(
-                isinstance(v, str) and compiled_regex.search(v)
-                for v in action.args.values()
+                compiled_regex.search(s)
+                for s in _iter_strings(action.args)
             )
             if not found:
                 return False

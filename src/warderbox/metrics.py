@@ -32,6 +32,10 @@ def prometheus_metrics(shield: WarderBox) -> str:
     rl = stats["rate_limits"]
 
     lines = [
+        "# HELP warderbox_degraded 1 while shared state is unavailable and these numbers are local.",
+        "# TYPE warderbox_degraded gauge",
+        f'warderbox_degraded {int(stats["degraded"])}',
+        "",
         "# HELP warderbox_actions_total Total number of agent actions.",
         "# TYPE warderbox_actions_total counter",
         f'warderbox_actions_total {stats["total_actions"]}',
