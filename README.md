@@ -444,9 +444,9 @@ Test agent resilience with controlled fault injection:
 ```python
 from warderbox import ChaosEngine, FaultType
 
-# Faults fire wherever the engine is attached: against real calls in production
-# mode (with a RuntimeWarning when attached), and in test mode without running the
-# Inert in production by default; opt in explicitly for a drill.
+# Chaos is inert in production by default; opt in explicitly for a drill.
+# With allow_production=True, faults fire against real calls (and a RuntimeWarning
+# is raised when attached). In test mode they fire without running the real tool.
 chaos = ChaosEngine(allow_production=True)
 shield.set_chaos(chaos)
 

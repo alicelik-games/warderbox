@@ -338,4 +338,4 @@ def test_concurrent_timeout_and_idempotency():
 
 def test_version():
     from warderbox import __version__
-    assert __version__ == "0.3.7"
+    assert __version__ == "0.3.8"

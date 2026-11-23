@@ -105,4 +105,4 @@ __all__ = [
     "rules_from_config",
     "validate_policy",
 ]
-__version__ = "0.3.7"
+__version__ = "0.3.8"

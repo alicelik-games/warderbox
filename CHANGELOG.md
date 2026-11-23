@@ -2,6 +2,14 @@
 
 All notable changes to WarderBox are documented here.
 
+## [0.3.8] - 2026-11-24
+
+Packaging and documentation only; no code changes from 0.3.7.
+
+### Fixed
+- **License metadata** (`pyproject.toml`): PyPI now shows the PolyForm Noncommercial 1.0.0 license (SPDX `LicenseRef-PolyForm-Noncommercial-1.0.0`) instead of "Other/Proprietary License"
+- **README**: the Chaos Engineering example's comment was cut off mid-sentence
+
 ## [0.3.7] - 2026-11-07
 
 Security, correctness and architecture work after 0.3.6 (1013 tests). **0.3.6 on
