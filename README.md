@@ -19,7 +19,7 @@ WarderBox intercepts every tool call your AI agent makes and provides rollback, 
 
 **Zero mandatory dependencies. One `pip install`. Works with 5 major agent frameworks — or plain Python.**
 
-> **Market context:** With Guardrails AI acquired by Harvey (Sept 2026) and the AI agent safety market projected to grow from \$610M to \$6.85B at 41% CAGR, WarderBox fills the gap as a comprehensive, framework-agnostic agent operations platform.
+> **Market context:** Guardrails AI was [acquired by Harvey](https://www.harvey.ai/blog/guardrails-ai-joins-harvey) in September 2026, and MarketsandMarkets [projects](https://www.marketsandmarkets.com/Market-Reports/agentic-ai-governance-guardrails-market-156785354.html) the agentic AI governance and guardrails market to grow from \$610M (2025) to \$6.85B by 2032, a 41% CAGR. WarderBox fills the gap as a comprehensive, framework-agnostic agent operations platform.
 
 ## Why WarderBox?
 
